@@ -24,7 +24,14 @@ class GuiRpcLauncher(PyGhidraLauncher):
         self._shutdown_requested = False
 
     def _launch(self) -> None:
-        """Start the Ghidra GUI without blocking the caller."""
+        """Start the Ghidra GUI without blocking the caller.
+
+        The project path is passed directly to GhidraRun so Ghidra opens the
+        requested project immediately on startup, bypassing the
+        "restore last-used project" behaviour.  This avoids races with
+        Ghidra's own project-restore sequence and eliminates the need for any
+        post-startup project-switching logic.
+        """
         from ghidra import Ghidra
         from java.lang import Runtime, Thread  # type: ignore
 
@@ -34,12 +41,14 @@ class GuiRpcLauncher(PyGhidraLauncher):
 
         Runtime.getRuntime().addShutdownHook(Thread(self._is_exiting.set))
 
+        # Pass the .gpr path as the first argument so GhidraRun opens the right
+        # project from the start instead of auto-restoring the last-used one.
+        args = ["ghidra.GhidraRun", str(self.project_gpr_path), *self.args]
+
         stdout = _PyGhidraStdOut(sys.stdout)
         stderr = _PyGhidraStdOut(sys.stderr)
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            Thread(
-                lambda: Ghidra.main(["ghidra.GhidraRun", *self.args])
-            ).start()
+            Thread(lambda: Ghidra.main(args)).start()
 
     def run_gui_event_loop(self) -> None:
         """Block until the GUI is shutting down."""

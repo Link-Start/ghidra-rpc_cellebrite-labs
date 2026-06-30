@@ -31,12 +31,22 @@ Before using any commands, verify the setup:
    startup use `start --detach --headless` or `restart --headless`. Both commands accept
    `--timeout SECS` (default: 60 s headless, 180 s GUI) and log daemon output to
    `/tmp/ghidra-rpc-<hash>.log`.
-2. **GUI mode: open the binary in CodeBrowser.** In GUI mode the daemon discovers programs
+2. **GUI mode: verify the correct project is active.** The daemon passes the `--project` path
+   directly to GhidraRun so Ghidra opens the requested project immediately. After
+   `start --detach` (GUI mode), confirm the right project is loaded before issuing any
+   analysis commands:
+   ```bash
+   uv run ghidra-rpc list-project-programs --project /path/to/project.gpr
+   ```
+   Cross-check the returned binary names against what you expect. If the names don't match
+   (or a `warning` field appears in the response), stop and ask the user to open the correct
+   project in Ghidra's Project window before proceeding.
+3. **GUI mode: open the binary in CodeBrowser.** In GUI mode the daemon discovers programs
    via the running CodeBrowser tool. If the binary is in the project but not currently open
    in CodeBrowser, `list-binaries` will return empty and all commands will fail with
    "Binary not found". Use `list-project-programs` to see what's stored in the project,
    then double-click the program in Ghidra's Project window to open it.
-3. **Is `GHIDRA_INSTALL_DIR` set?** The daemon will fail loudly if this is missing.
+4. **Is `GHIDRA_INSTALL_DIR` set?** The daemon will fail loudly if this is missing.
 
 Once the daemon is running, all commands below work automatically. If the daemon dies,
 commands will attempt auto-restart from the saved session.
@@ -59,7 +69,7 @@ All output is JSON. Exit code 0 = success, 1 = error.
 session only (daemon stopped), and `null` if no session exists.
 | `ghidra-rpc restart --project <gpr> [--headless] [--timeout SECS] [--ghidra-install-dir DIR]` | Restart daemon in background (`--headless` to override mode) | `ghidra-rpc restart -p /tmp/re.gpr --headless` |
 | `ghidra-rpc list-binaries --project <gpr>` | List binaries loaded in daemon | `ghidra-rpc list-binaries -p /tmp/re.gpr` |
-| `ghidra-rpc list-project-programs --project <gpr>` | List all programs in the project repo (no GUI required) | `ghidra-rpc list-project-programs -p /tmp/re.gpr` |
+| `ghidra-rpc list-project-programs --project <gpr>` | List all programs stored in the project repo (reads project folder, not CodeBrowser live state; returns `warning` if the active Ghidra project doesn't match) | `ghidra-rpc list-project-programs -p /tmp/re.gpr` |
 | `ghidra-rpc save [binary] --project <gpr>` | Save program(s) to disk (auto-save also runs after every write) | `ghidra-rpc save -p /tmp/re.gpr` |
 
 ### Loading & Analysis

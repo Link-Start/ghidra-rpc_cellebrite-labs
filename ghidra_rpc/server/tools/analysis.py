@@ -50,14 +50,31 @@ def _handle_list_project_programs(ctx, args: dict) -> dict:
     project folder directly.
     """
     programs = []
+    warning = None
 
-    # Headless mode: the project handle is on ctx.project
     project = getattr(ctx, "project", None)
-    if project is None:
-        # GUI mode: use AppInfo
+
+    # In GUI mode, always fetch the freshest active project from AppInfo and
+    # validate it matches the project the daemon was started against.  ctx.project
+    # is set at daemon startup and can become stale if the user switches projects
+    # inside the Ghidra GUI after the daemon launched.
+    if hasattr(ctx, "run_on_swing"):
         try:
             from ghidra.framework.main import AppInfo
-            project = AppInfo.getActiveProject()
+            from ghidra_rpc.server.context import GuiContext
+            active = AppInfo.getActiveProject()
+            if active is not None:
+                if not GuiContext._project_matches(active, ctx.session):
+                    locator = active.getProjectLocator()
+                    active_name = str(locator.getName())
+                    expected_name = ctx.session.project_gpr.stem
+                    warning = (
+                        f"Active Ghidra project '{active_name}' does not match "
+                        f"expected project '{expected_name}'. The programs listed "
+                        f"below are from the wrong project. Open '{expected_name}' "
+                        f"in Ghidra's Project window and retry."
+                    )
+                project = active
         except Exception:
             pass
 
@@ -87,7 +104,10 @@ def _handle_list_project_programs(ctx, args: dict) -> dict:
     except Exception as exc:
         raise RuntimeError(f"Failed to enumerate project folder: {exc}") from exc
 
-    return {"programs": programs, "count": len(programs)}
+    result = {"programs": programs, "count": len(programs)}
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def _handle_list_functions(ctx, args: dict) -> dict:

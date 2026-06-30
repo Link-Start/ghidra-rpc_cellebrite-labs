@@ -60,11 +60,56 @@ def create_gui_context(session: Session):
     from ghidra_rpc.server._gui_launcher import GuiRpcLauncher
     from ghidra_rpc.server.context import GuiContext
 
+    # The GUI is launched by passing the .gpr path to GhidraRun, which *opens*
+    # the project but cannot *create* one.  Pre-create the project on disk for
+    # the new-project case so GhidraRun has something to open.  This must run in
+    # a separate process: a headless pyghidra.start() in this process would
+    # start the JVM, after which the GUI launcher's start() short-circuits and
+    # the GUI never comes up.
+    _ensure_project_exists(session.project_gpr)
+
     launcher = GuiRpcLauncher(session.project_gpr)
     launcher.start()
 
     ctx = GuiContext(session, launcher)
     return ctx
+
+
+# Headless snippet run in a subprocess to create an empty Ghidra project on
+# disk.  Kept self-contained so it can be passed to ``python -c``.
+_CREATE_PROJECT_SNIPPET = """\
+import sys
+import pyghidra
+pyghidra.start()
+from ghidra.base.project import GhidraProject
+from ghidra.framework.model import ProjectLocator
+project_dir, project_name = sys.argv[1], sys.argv[2]
+locator = ProjectLocator(project_dir, project_name)
+if not locator.exists():
+    GhidraProject.createProject(project_dir, project_name, False).close()
+"""
+
+
+def _ensure_project_exists(project_gpr: Path) -> None:
+    """Create the Ghidra project on disk if it does not already exist.
+
+    Runs a short-lived headless pyghidra subprocess so the GUI daemon's own JVM
+    is left untouched.  No-op when the project already exists.
+    """
+    if project_gpr.exists():
+        return
+
+    import subprocess
+
+    project_dir = str(project_gpr.parent.resolve())
+    project_name = project_gpr.stem
+    project_gpr.parent.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        [sys.executable, "-c", _CREATE_PROJECT_SNIPPET, project_dir, project_name],
+        env=os.environ.copy(),
+        check=True,
+    )
 
 
 # macOS framework Python handling (copied from pyghidra-mcp)

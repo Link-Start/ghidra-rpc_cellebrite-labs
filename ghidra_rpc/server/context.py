@@ -410,82 +410,69 @@ class GuiContext:
         logger.info("GUI context ready")
 
     @staticmethod
+    def _project_matches(project, session: "Session") -> bool:
+        """Return True if *project* is the Ghidra project described by session.project_gpr.
+
+        Key implementation notes:
+        - ``ProjectLocator.getProjectDir()`` returns the ``.rep`` data *subdirectory*
+          (e.g. ``/path/projA/projA.rep``), NOT the parent folder — do not use it
+          for path comparison.
+        - ``ProjectLocator.getLocation()`` returns the raw location string stored in
+          the locator, which ``GhidraURL.checkLocalAbsolutePath`` normalises with a
+          trailing ``/`` (e.g. ``/path/projA/``).  Wrap in ``Path.resolve()`` to
+          strip the trailing slash before comparing.
+        """
+        try:
+            locator = project.getProjectLocator()
+            # getLocation() → e.g. "/tmp/ghidra-multi-test/projA/"
+            actual_dir = Path(str(locator.getLocation())).resolve()
+            expected_dir = session.project_gpr.parent.resolve()
+            actual_name = str(locator.getName())
+            expected_name = session.project_gpr.stem
+            return actual_dir == expected_dir and actual_name == expected_name
+        except Exception:
+            return False
+
+    @staticmethod
     def _wait_for_project(session: Session, timeout: float = 240.0):
-        """Wait for Ghidra GUI to have an active project, opening one if needed."""
+        """Wait for Ghidra GUI to open the requested project.
+
+        GhidraRun is passed the project path as a command-line argument (see
+        GuiRpcLauncher._launch), so Ghidra opens it directly on startup without
+        auto-restoring a different last-used project.  This method simply polls
+        AppInfo.getActiveProject() until the matching project appears.
+
+        If it does not appear within *timeout* seconds (e.g. because the project
+        is locked by another Ghidra instance and the user dismissed the dialog),
+        a RuntimeError is raised with a human-readable message.
+        """
         from ghidra.framework.main import AppInfo
 
         deadline = time.time() + timeout
-        attempted_open = False
+        last_log = 0.0
         while time.time() < deadline:
             try:
                 project = AppInfo.getActiveProject()
-                if project is not None:
+                if project is not None and GuiContext._project_matches(project, session):
                     return project
             except Exception:
                 pass
 
-            # Once the front-end tool is available, try to open/create the project
-            if not attempted_open:
-                try:
-                    front_end_tool = AppInfo.getFrontEndTool()
-                except Exception:
-                    front_end_tool = None
-
-                if front_end_tool is not None:
-                    attempted_open = True
-                    try:
-                        import jpype
-                        from ghidra.util import Swing
-                        from java.lang import Runnable  # type: ignore
-
-                        result_box = [None]
-                        exc_box = [None]
-
-                        def do_open():
-                            try:
-                                result_box[0] = GuiContext._open_gui_project(
-                                    front_end_tool, session
-                                )
-                            except BaseException as e:
-                                exc_box[0] = e
-
-                        Swing.runNow(jpype.JProxy(Runnable, dict={"run": do_open}))
-                        if exc_box[0] is not None:
-                            raise exc_box[0]
-                        project = result_box[0]
-                        if project is not None:
-                            return project
-                    except Exception:
-                        logger.exception(
-                            "Failed to open GUI project %s; continuing to wait.",
-                            session.project_gpr,
-                        )
+            # Periodically remind the user what we're waiting for (every 15 s).
+            now = time.time()
+            if now - last_log >= 15:
+                logger.info(
+                    "Waiting for Ghidra to open project: %s", session.project_gpr
+                )
+                last_log = now
 
             time.sleep(0.5)
-        raise RuntimeError(f"Timed out waiting for Ghidra GUI project: {session.project_gpr}")
 
-    @staticmethod
-    def _open_gui_project(front_end_tool, session: Session):
-        """Open or create the requested project in the Ghidra GUI."""
-        from ghidra.framework.main import AppInfo
-        from ghidra.framework.model import ProjectLocator
-
-        active = AppInfo.getActiveProject()
-        if active is not None:
-            return active
-
-        gpr = session.project_gpr
-        project_dir = gpr.parent
-        project_name = gpr.stem
-        project_dir.mkdir(parents=True, exist_ok=True)
-
-        project_manager = front_end_tool.getProjectManager()
-        locator = ProjectLocator(str(project_dir.resolve()), project_name)
-
-        if locator.exists():
-            return project_manager.openProject(locator, True, False)
-        else:
-            return project_manager.createProject(locator, None, True)
+        raise RuntimeError(
+            f"Timed out waiting for Ghidra to open project: {session.project_gpr}\n"
+            "If the project is locked by another Ghidra instance, close that "
+            "instance first, then restart the daemon."
+        )
 
     def run_on_swing(self, fn, *args, **kwargs):
         """Execute fn on the Swing EDT and return the result."""
