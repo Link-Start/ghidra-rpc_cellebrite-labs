@@ -794,6 +794,63 @@ def rename_variable(binary: str, func: str, variable: str, new_name: str,
     })
 
 
+@cli.command(name="batch-edit-variable")
+@click.argument("binary")
+@click.argument("func")
+@click.option(
+    "--json", "json_data", default="",
+    help="JSON array of variable-edit operations (inline string).",
+)
+@click.option(
+    "--json-file", "json_file", default=None,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    help="Path to a JSON file containing the edit operations.",
+)
+@click.option("--timeout", "-t", type=int, default=60, show_default=True,
+              help="Decompiler timeout in seconds.")
+@click.option("--project", "-p", type=str, help="Path to .gpr project file")
+def batch_edit_variable(
+    binary: str, func: str,
+    json_data: str, json_file: str,
+    timeout: int, project: str | None,
+):
+    """Rename and/or retype many local variables in ONE decompiler snapshot.
+
+    The function is decompiled once and every edit is applied in a single
+    transaction, so auto-named locals do not renumber between edits (the
+    failure mode of chaining single rename-variable / retype-variable calls).
+
+    Each op identifies its variable by exactly one of "variable" (current name)
+    or "storage" (e.g. "Stack[-0x18]:4", "EAX:4"), and supplies "new_name"
+    and/or "data_type" (either may be omitted to change only the other).
+
+    \b
+    Example:
+      [{"variable": "dVar1", "new_name": "pace", "data_type": "double"},
+       {"variable": "dVar2", "new_name": "watts"},
+       {"storage":  "Stack[-0x18]:8", "data_type": "Split *"}]
+
+    Per-item results report old/new name+type and a `verified` read-back flag.
+    """
+    if json_file:
+        with open(json_file) as f:
+            operations = json.load(f)
+    elif json_data:
+        try:
+            operations = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            click.echo(f"Error: invalid JSON: {e}", err=True)
+            sys.exit(1)
+    else:
+        click.echo("Error: provide --json or --json-file.", err=True)
+        sys.exit(1)
+
+    _rpc_command(_resolve_project(project), "batch_edit_variables", {
+        "binary": binary, "func": func,
+        "operations": operations, "timeout": timeout,
+    })
+
+
 @cli.command(name="write-bytes")
 @click.argument("binary")
 @click.argument("address")

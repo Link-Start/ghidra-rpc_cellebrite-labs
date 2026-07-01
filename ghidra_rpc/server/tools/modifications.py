@@ -769,6 +769,241 @@ def _handle_rename_variable(ctx, args: dict) -> dict:
     }
 
 
+def _handle_batch_edit_variables(ctx, args: dict) -> dict:
+    """Batch rename and/or retype local variables in a SINGLE decompiler snapshot.
+
+    The function is decompiled **once**; every operation is resolved against that
+    single snapshot and all edits are applied in one transaction.  This avoids the
+    renumber churn that afflicts sequential single-variable commands — each of
+    ``rename-variable`` / ``retype-variable`` re-decompiles and can re-number the
+    remaining auto-named locals, so a ``dVar2`` may become ``dVar1`` before the
+    second call runs.  Here the held ``HighSymbol`` handles stay valid across
+    sibling edits, so callers address variables by their *current* identity.
+
+    Each operation identifies its variable by **exactly one** of:
+      * ``variable`` — current decompiler name (e.g. ``local_18``, ``uVar1``)
+      * ``storage``  — Ghidra storage string (e.g. ``Stack[-0x18]:4``, ``EAX:4``);
+                       stable across re-decompilation, unlike auto names.
+    and supplies ``new_name`` and/or ``data_type`` (at least one; either may be
+    omitted to change only the other).
+
+    Args (in ``args`` dict):
+        binary     -- program name / key
+        func       -- function name or address
+        operations -- list of {variable|storage, new_name?, data_type?}
+        timeout    -- decompiler timeout in seconds (default 60)
+
+    Returns a dict with:
+        function       -- resolved function name
+        results        -- per-item {ok, index, variable, storage, old_name,
+                          new_name, old_type, new_type, verified} or
+                          {ok:False, index, error, message}
+        count, ok_count, error_count, verified_count
+
+    Note: a retype whose new storage overlaps a neighbouring variable can be
+    silently reverted by the decompiler (a genuine storage conflict).  The final
+    read-back sets ``verified: false`` for any edit that did not stick.
+    """
+    binary     = args.get("binary", "")
+    func_name  = args.get("func", "")
+    operations = args.get("operations", [])
+    timeout    = int(args.get("timeout", 60))
+
+    if not func_name:
+        raise ValueError("Missing required argument: func")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("'operations' must be a non-empty list")
+
+    pi   = ctx.get_program(binary)
+    func = _find_function(pi, func_name)
+
+    # ---- Step 1: decompile ONCE (blocking; not on Swing EDT) -----------------
+    from ghidra.util.task import TaskMonitor
+
+    with pi.decompiler_pool.acquire() as decompiler:
+        result = decompiler.decompileFunction(func, timeout, TaskMonitor.DUMMY)
+
+    err = result.getErrorMessage()
+    if err and str(err).strip():
+        raise RuntimeError(f"Decompilation failed for '{func.getName()}': {err}")
+
+    high_func = result.getHighFunction()
+    if high_func is None:
+        raise RuntimeError(f"Could not obtain high function for '{func.getName()}'")
+
+    # Index the single snapshot by both name and storage.
+    by_name: dict = {}
+    by_storage: dict = {}
+    for sym in high_func.getLocalSymbolMap().getSymbols():
+        by_name[str(sym.getName())] = sym
+        by_storage[str(sym.getStorage())] = sym
+    avail_names    = sorted(by_name.keys())
+    avail_storages = sorted(by_storage.keys())
+
+    # ---- Step 2: resolve every op against the snapshot (no DB writes yet) ----
+    results  = [None] * len(operations)
+    resolved = []
+    for idx, op in enumerate(operations):
+        variable = str(op.get("variable", "") or "").strip()
+        storage  = str(op.get("storage", "") or "").strip()
+
+        new_name  = op.get("new_name")
+        new_name  = (str(new_name).strip() or None) if new_name is not None else None
+        data_type = op.get("data_type")
+        data_type = (str(data_type).strip() or None) if data_type is not None else None
+
+        # Exactly one identifier.
+        if bool(variable) == bool(storage):
+            results[idx] = {
+                "ok": False, "index": idx, "error": "ValueError",
+                "message": "each op must specify exactly one of 'variable' or 'storage'",
+            }
+            continue
+        # At least one edit.
+        if not new_name and not data_type:
+            results[idx] = {
+                "ok": False, "index": idx, "error": "ValueError",
+                "message": "each op must specify 'new_name' and/or 'data_type'",
+            }
+            continue
+
+        if variable:
+            sym = by_name.get(variable)
+            if sym is None:
+                results[idx] = {
+                    "ok": False, "index": idx, "variable": variable,
+                    "error": "ValueError",
+                    "message": (f"Variable '{variable}' not found in "
+                                f"'{func.getName()}'. Available: {avail_names}"),
+                }
+                continue
+        else:
+            sym = by_storage.get(storage)
+            if sym is None:
+                results[idx] = {
+                    "ok": False, "index": idx, "storage": storage,
+                    "error": "ValueError",
+                    "message": (f"Storage '{storage}' not found in "
+                                f"'{func.getName()}'. Available: {avail_storages}"),
+                }
+                continue
+
+        # Resolve the data type now so a bad type name fails before the tx.
+        new_dt = None
+        if data_type:
+            try:
+                new_dt = _resolve_data_type(pi.program, data_type)
+            except Exception as e:
+                results[idx] = {
+                    "ok": False, "index": idx, "variable": str(sym.getName()),
+                    "error": type(e).__name__, "message": str(e),
+                }
+                continue
+
+        resolved.append({
+            "idx":      idx,
+            "sym":      sym,
+            "new_name": new_name,
+            "new_dt":   new_dt,
+            "old_name": str(sym.getName()),
+            "old_type": str(sym.getDataType()),
+            "storage":  str(sym.getStorage()),
+        })
+
+    # ---- Step 3: apply all resolved edits in ONE transaction -----------------
+    if resolved:
+        def do_batch():
+            from ghidra.program.model.pcode import HighFunctionDBUtil
+            from ghidra.program.model.symbol import SourceType
+
+            with ghidra_transaction(
+                pi.program,
+                f"ghidra-rpc: batch-edit-variable ({len(resolved)} ops) "
+                f"in {func.getName()}",
+            ):
+                for item in resolved:
+                    sym = item["sym"]
+                    # updateDBVariable needs a name; preserve the current one when
+                    # this op only retypes.  Read the name at apply time so an
+                    # earlier op that renamed the same symbol is respected.
+                    name_to_set = (item["new_name"]
+                                   if item["new_name"] is not None
+                                   else str(sym.getName()))
+                    try:
+                        HighFunctionDBUtil.updateDBVariable(
+                            sym, name_to_set, item["new_dt"], SourceType.USER_DEFINED
+                        )
+                    except Exception as e:
+                        item["apply_error"] = (type(e).__name__, str(e))
+
+        _maybe_swing(ctx, do_batch)
+        pi.decompiler_pool.invalidate_all()
+        ctx.save_program(pi)
+
+    # ---- Step 4: single re-decompile to verify what actually stuck ----------
+    verify_map: dict = {}
+    if resolved:
+        try:
+            with pi.decompiler_pool.acquire() as decompiler:
+                from ghidra.util.task import TaskMonitor as _TM
+                result2 = decompiler.decompileFunction(func, timeout, _TM.DUMMY)
+            hf2 = result2.getHighFunction()
+            if hf2:
+                for sym2 in hf2.getLocalSymbolMap().getSymbols():
+                    verify_map[str(sym2.getName())] = str(sym2.getDataType())
+        except Exception:
+            pass
+
+    for item in resolved:
+        idx = item["idx"]
+        if item.get("apply_error"):
+            etype, emsg = item["apply_error"]
+            results[idx] = {
+                "ok": False, "index": idx,
+                "variable": item["old_name"], "storage": item["storage"],
+                "error": etype, "message": emsg,
+            }
+            continue
+
+        expected_name = (item["new_name"] if item["new_name"] is not None
+                         else item["old_name"])
+        actual_type = verify_map.get(expected_name)
+        name_ok = expected_name in verify_map
+        if item["new_dt"] is not None:
+            want = str(item["new_dt"].getName())
+            type_ok = actual_type is not None and (
+                actual_type == want or actual_type == str(item["new_dt"])
+            )
+            reported_type = actual_type if actual_type is not None else want
+        else:
+            type_ok = True
+            reported_type = actual_type if actual_type is not None else item["old_type"]
+
+        results[idx] = {
+            "ok":        True,
+            "index":     idx,
+            "variable":  item["old_name"],
+            "storage":   item["storage"],
+            "old_name":  item["old_name"],
+            "new_name":  expected_name,
+            "old_type":  item["old_type"],
+            "new_type":  reported_type,
+            "verified":  bool(name_ok and type_ok),
+        }
+
+    final = [r for r in results if r is not None]
+    ok_count       = sum(1 for r in final if r.get("ok"))
+    verified_count = sum(1 for r in final if r.get("verified"))
+    return {
+        "function":       str(func.getName()),
+        "results":        final,
+        "count":          len(final),
+        "ok_count":       ok_count,
+        "error_count":    len(final) - ok_count,
+        "verified_count": verified_count,
+    }
+
+
 def _handle_create_function(ctx, args: dict) -> dict:
     """Create a function at an address where Ghidra hasn't auto-detected one.
 
@@ -1535,6 +1770,7 @@ register_handler("set_function_signature",    _handle_set_function_signature)
 register_handler("set_data_type",             _handle_set_data_type)
 register_handler("retype_variable",           _handle_retype_variable)
 register_handler("rename_variable",           _handle_rename_variable)
+register_handler("batch_edit_variables",      _handle_batch_edit_variables)
 register_handler("set_calling_convention",    _handle_set_calling_convention)
 register_handler("set_thunk",                 _handle_set_thunk)
 register_handler("set_flow_override",         _handle_set_flow_override)

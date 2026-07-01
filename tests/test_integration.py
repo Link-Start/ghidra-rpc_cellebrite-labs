@@ -1626,3 +1626,225 @@ class TestRenameVariable:
             assert exc.error in ("ValueError", "RuntimeError", "Exception"), (
                 f"Unexpected error type: {exc.error}"
             )
+
+
+# ── 16. Batch edit variables ──────────────────────────────────────────────────
+
+class TestBatchEditVariable:
+    """Integration tests for ``batch_edit_variables``.
+
+    Uses ``str_dup_upper`` (one ``const char *`` param plus several -O0 locals)
+    so the decompiler exposes at least two editable variables.  Each test
+    restores the variables it touches so the shared module-scoped daemon stays
+    consistent for other tests.
+    """
+
+    _FUNC = "str_dup_upper"
+
+    def _variable_names(self, daemon, minimum=2):
+        names = _discover_variables(
+            daemon["sock"], daemon["short_name"], self._FUNC
+        )
+        if len(names) < minimum:
+            pytest.skip(
+                f"Need >= {minimum} decompiler variables in '{self._FUNC}'; "
+                f"found {names}"
+            )
+        return names
+
+    def test_batch_rename_two_vars_single_snapshot(self, daemon):
+        """Two renames in one call both succeed and verify — the core #1 fix."""
+        names = self._variable_names(daemon)
+        v1, v2 = names[0], names[1]
+        uid = uuid.uuid4().hex[:8]
+        n1, n2 = f"ba_{uid}", f"bb_{uid}"
+
+        result = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"],
+            "func":   self._FUNC,
+            "operations": [
+                {"variable": v1, "new_name": n1},
+                {"variable": v2, "new_name": n2},
+            ],
+        })["result"]
+
+        assert result["count"] == 2, result
+        assert result["ok_count"] == 2, result
+        assert result["error_count"] == 0, result
+        assert result["verified_count"] == 2, (
+            f"Both renames should verify in a single snapshot; got: {result}"
+        )
+        new_names = {r["new_name"] for r in result["results"]}
+        assert new_names == {n1, n2}, result
+
+        # Cleanup: rename both back in one batch.
+        rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [
+                {"variable": n1, "new_name": v1},
+                {"variable": n2, "new_name": v2},
+            ],
+        })
+
+    def test_batch_rename_and_retype_combined(self, daemon):
+        """A single op may set both new_name and data_type; both must apply."""
+        names = self._variable_names(daemon)
+        target = next((n for n in names if n.startswith("param_")), names[0])
+        uid = uuid.uuid4().hex[:8]
+        new_name = f"combo_{uid}"
+
+        result = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"],
+            "func":   self._FUNC,
+            "operations": [
+                {"variable": target, "new_name": new_name, "data_type": "long"},
+            ],
+        })["result"]
+
+        item = result["results"][0]
+        assert item["ok"] is True, item
+        assert item["new_name"] == new_name, item
+        assert item["verified"] is True, (
+            f"Combined rename+retype should verify; got: {item}"
+        )
+        assert "long" in item["new_type"].lower(), item
+
+        # Cleanup: restore original name.
+        rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"variable": new_name, "new_name": target}],
+        })
+
+    def test_batch_edit_by_storage(self, daemon):
+        """A variable can be addressed by its (stable) storage string."""
+        names = self._variable_names(daemon)
+        v1 = names[0]
+        uid = uuid.uuid4().hex[:8]
+        n1 = f"stg_{uid}"
+
+        # First edit by name; the response carries the variable's storage.
+        first = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"variable": v1, "new_name": n1}],
+        })["result"]["results"][0]
+        storage = first.get("storage")
+        assert storage, f"expected a storage string in result: {first}"
+
+        # Now retype the same variable addressed purely by storage.
+        by_storage = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"storage": storage, "data_type": "long"}],
+        })["result"]["results"][0]
+
+        assert by_storage["ok"] is True, by_storage
+        assert by_storage["storage"] == storage, by_storage
+        assert by_storage["verified"] is True, (
+            f"Storage-addressed retype should verify; got: {by_storage}"
+        )
+
+        # Cleanup: rename back by name.
+        rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"variable": n1, "new_name": v1}],
+        })
+
+    def test_batch_partial_failure_reports_per_item(self, daemon):
+        """A bogus variable fails per-item (with Available:) without aborting others."""
+        names = self._variable_names(daemon)
+        good = names[0]
+        uid = uuid.uuid4().hex[:8]
+        good_new = f"ok_{uid}"
+
+        result = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [
+                {"variable": good, "new_name": good_new},
+                {"variable": "__no_such_var__", "new_name": "nope"},
+            ],
+        })["result"]
+
+        assert result["ok_count"] == 1, result
+        assert result["error_count"] == 1, result
+        bad = next(r for r in result["results"] if not r["ok"])
+        assert "__no_such_var__" in bad["message"], bad
+        assert "Available:" in bad["message"], (
+            f"error should list available variables (issue #3): {bad}"
+        )
+
+        # Cleanup: rename the good one back.
+        rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"variable": good_new, "new_name": good}],
+        })
+
+    def test_batch_op_without_edit_is_rejected(self, daemon):
+        """An op with neither new_name nor data_type is a per-item error."""
+        names = self._variable_names(daemon)
+        result = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": self._FUNC,
+            "operations": [{"variable": names[0]}],
+        })["result"]
+
+        assert result["ok_count"] == 0, result
+        assert result["error_count"] == 1, result
+        assert "new_name" in result["results"][0]["message"], result
+
+    def test_batch_overlapping_retype_reports_unverified(self, daemon):
+        """A retype whose new storage overlaps a neighbour is applied but reverts;
+        the per-item ``verified`` flag must report that it did not stick.
+
+        This exercises the documented sharp edge (a storage conflict silently
+        reverts the edit) and locks in the guarantee that ``verified`` catches it.
+        Runs against ``main`` — which has a block of adjacent 4-byte stack locals —
+        so it does not disturb the other tests' target function.
+        """
+        import re
+
+        func = "main"
+        names = _discover_variables(daemon["sock"], daemon["short_name"], func)
+        if len(names) < 2:
+            pytest.skip(f"need >= 2 vars in '{func}'; found {names}")
+
+        # Probe: rename every local to read back its storage + current type.
+        probe = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": func,
+            "operations": [{"variable": n, "new_name": f"{n}__p"} for n in names],
+        })["result"]
+
+        # Collect 4-byte stack slots as (offset, current_name).
+        slots = []
+        for r in probe["results"]:
+            if not r.get("ok"):
+                continue
+            m = re.match(r"Stack\[(-?0x[0-9a-fA-F]+)\]:(\d+)", r.get("storage", ""))
+            if m and int(m.group(2)) == 4 and r.get("old_type") == "undefined4":
+                slots.append((int(m.group(1), 16), r["new_name"]))
+
+        # Find an adjacent pair (stack offsets exactly 4 apart).
+        slots.sort()
+        pair = next(
+            ((slots[i][1], slots[i + 1][1])
+             for i in range(len(slots) - 1)
+             if slots[i + 1][0] - slots[i][0] == 4),
+            None,
+        )
+        if pair is None:
+            pytest.skip("no adjacent 4-byte stack slots available to force an overlap")
+
+        lower, upper = pair
+        # Grow both adjacent 4-byte slots to 8-byte types -> they must collide.
+        result = rpc(daemon["sock"], "batch_edit_variables", {
+            "binary": daemon["short_name"], "func": func,
+            "operations": [
+                {"variable": lower, "new_name": "ov_a", "data_type": "double"},
+                {"variable": upper, "new_name": "ov_b", "data_type": "double"},
+            ],
+        })["result"]
+
+        assert result["ok_count"] == 2, (
+            f"overlapping retypes apply without exception (silent revert): {result}"
+        )
+        assert result["verified_count"] < 2, (
+            f"an overlapping retype must revert and report verified=false: {result}"
+        )
+        assert any(r.get("verified") is False for r in result["results"]), result

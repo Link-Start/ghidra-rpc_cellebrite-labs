@@ -153,6 +153,7 @@ is ambiguous, the error message lists matches so you can use the address instead
 | `ghidra-rpc set-data-type <binary> <address> <type>` | Define data type in listing | `{address, data_type, length, value}` |
 | `ghidra-rpc retype-variable <binary> <func> <variable> <type> [--timeout SECS]` | Retype decompiler variable | `{function, variable, old_type, new_type, verified}` |
 | `ghidra-rpc rename-variable <binary> <func> <variable> <new_name> [--timeout SECS]` | Rename decompiler variable | `{function, variable, new_name, verified}` |
+| `ghidra-rpc batch-edit-variable <binary> <func> --json \|--json-file FILE [--timeout SECS]` | Rename and/or retype many locals in ONE decompiler snapshot — avoids the auto-name renumbering that breaks chained single edits. Each op: `{variable\|storage, new_name?, data_type?}` (identify by name or storage string; at least one of new_name/data_type) | `{function, results:[{ok, index, variable, storage, old_name, new_name, old_type, new_type, verified}], count, ok_count, error_count, verified_count}` |
 | `ghidra-rpc set-calling-convention <binary> <target> <convention>` | Change a function's calling convention | `{address, name, old_convention, new_convention, verified}` |
 | `ghidra-rpc set-thunk <binary> <thunk> <target>` | Mark a function as a thunk (forwarding wrapper) | `{thunk_address, thunk_name, target_address, target_name, verified}` |
 | `ghidra-rpc set-flow-override <binary> <address> <override>` | Override instruction flow type (NONE/BRANCH/CALL/CALL_RETURN/RETURN) | `{address, override, old_override, verified}` |
@@ -174,6 +175,15 @@ Type expressions for `set-data-type`, `retype-variable`, and struct field types:
 - Pointer: `char *`, `void *`, `int **`
 - Array: `char[11]`, `int[4]`
 - Any type in the program's data type manager by name or path: `MyStruct`, `/POSIX/size_t`
+
+**Order of operations — set signatures/types before naming locals.** Each of
+`set-signature`, `set-data-type`, `retype-variable`, and `rename-variable` re-runs the
+decompiler, which re-numbers the remaining auto-named locals (`uVar1`, `dVar2`, …). So
+chaining single-variable edits is fragile: after renaming `dVar1`, the old `dVar2` may
+now be `dVar1`. Do all signature/`this`-typing first, then name locals — or, better, use
+`batch-edit-variable` to apply every rename **and** retype against a single decompiler
+snapshot in one call (it also lets you address a variable by its stable `storage` string
+instead of the volatile auto name).
 
 ### Bookmarks
 
@@ -245,7 +255,7 @@ Common errors:
 
 ## Write Operations & Persistence
 
-Write operations (rename, create-label, create-function, delete-function, set-comment, batch-rename, batch-set-comment, set-signature, set-data-type, retype-variable, rename-variable, set-calling-convention, set-thunk, set-flow-override, set-processor-context, create-struct, create-union, modify-struct, create-enum, modify-enum, set-equate, set-bookmark, clear-data-range, apply-data-type-range, write-bytes, assemble, tag-function, untag-function, create-namespace)
+Write operations (rename, create-label, create-function, delete-function, set-comment, batch-rename, batch-set-comment, set-signature, set-data-type, retype-variable, rename-variable, batch-edit-variable, set-calling-convention, set-thunk, set-flow-override, set-processor-context, create-struct, create-union, modify-struct, create-enum, modify-enum, set-equate, set-bookmark, clear-data-range, apply-data-type-range, write-bytes, assemble, tag-function, untag-function, create-namespace)
 use Ghidra transactions internally. **Every write is automatically saved to the project
 database on disk** after the transaction commits, so changes survive daemon restarts and
 are visible when the project is reopened in the Ghidra GUI.
