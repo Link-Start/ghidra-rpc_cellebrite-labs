@@ -886,6 +886,51 @@ def read_bytes(binary: str, address: str, length: int, project: str | None):
     })
 
 
+@cli.command(name="read-pointers")
+@click.argument("binary")
+@click.argument("address")
+@click.argument("count", type=HEX_INT)
+@click.option("--pointer-size", "-s", type=HEX_INT, default=None,
+              help="Pointer width in bytes (1/2/4/8). Default: program's pointer size.")
+@click.option("--project", "-p", type=str, help="Path to .gpr project file")
+def read_pointers(binary: str, address: str, count: int,
+                  pointer_size: int | None, project: str | None):
+    """Read COUNT pointers at ADDRESS and resolve each to its symbol.
+
+    COUNT accepts decimal (18) or hex (0x12). Handy for vtables, import
+    tables, jump tables, and RTTI pointer arrays.
+    """
+    args = {"binary": binary, "address": address, "count": count}
+    if pointer_size is not None:
+        args["pointer_size"] = pointer_size
+    _rpc_command(_resolve_project(project), "read_pointers", args)
+
+
+@cli.command(name="list-vtable")
+@click.argument("binary")
+@click.argument("address")
+@click.option("--count", "-c", type=HEX_INT, default=None,
+              help="Fixed slot count (overrides auto-termination at the next "
+                   "vftable symbol / first non-function pointer).")
+@click.option("--pointer-size", "-s", type=HEX_INT, default=None,
+              help="Pointer width in bytes. Default: program's pointer size.")
+@click.option("--project", "-p", type=str, help="Path to .gpr project file")
+def list_vtable(binary: str, address: str, count: int | None,
+                pointer_size: int | None, project: str | None):
+    """List the slots of a C++ vtable at ADDRESS (hex address or symbol name).
+
+    Each slot is resolved to its target function. Without --count, the walk
+    stops at the next vftable symbol, the first non-function pointer, or a
+    hard cap — see `stopped_reason` in the output.
+    """
+    args = {"binary": binary, "address": address}
+    if count is not None:
+        args["count"] = count
+    if pointer_size is not None:
+        args["pointer_size"] = pointer_size
+    _rpc_command(_resolve_project(project), "list_vtable", args)
+
+
 @cli.command(name="relocations")
 @click.argument("binary")
 @click.option("--address", "-a", default="",

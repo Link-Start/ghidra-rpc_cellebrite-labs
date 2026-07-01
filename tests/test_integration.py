@@ -1848,3 +1848,162 @@ class TestBatchEditVariable:
             f"an overlapping retype must revert and report verified=false: {result}"
         )
         assert any(r.get("verified") is False for r in result["results"]), result
+
+
+# ── Memory-block helper ─────────────────────────────────────────────────────
+
+def _find_block(daemon, name):
+    """Return the memory_map segment dict named *name*, or skip if absent."""
+    segs = rpc(daemon["sock"], "memory_map",
+               {"binary": daemon["short_name"]})["result"]["segments"]
+    blk = next((s for s in segs if s["name"] == name), None)
+    if blk is None:
+        pytest.skip(f"binary has no '{name}' block; available: "
+                    f"{[s['name'] for s in segs]}")
+    return blk
+
+
+# ── 17. Read pointers ───────────────────────────────────────────────────────
+
+class TestReadPointers:
+    """Integration tests for ``read_pointers``.
+
+    Uses ``.got.plt`` — after relocation Ghidra fills it with a mix of a data
+    symbol (``_DYNAMIC``), zero slots, and resolved libc function pointers
+    (``free``/``strlen``/``printf``/``malloc``/``fwrite`` from testapp.c).
+    """
+
+    _LIBC = {"free", "strlen", "printf", "malloc", "fwrite"}
+
+    def test_read_pointers_structure(self, daemon):
+        blk = _find_block(daemon, ".got.plt")
+        n = blk["size"] // 8
+        result = rpc(daemon["sock"], "read_pointers", {
+            "binary": daemon["short_name"], "address": blk["start"], "count": n,
+        })["result"]
+
+        assert result["pointer_size"] == 8, result
+        assert result["endian"] == "little", result
+        assert result["count"] == n, result
+        assert len(result["pointers"]) == n, result
+        required = {"index", "offset", "slot_address", "value",
+                    "target_address", "target_name", "target_kind"}
+        for p in result["pointers"]:
+            assert required <= p.keys(), p
+
+    def test_read_pointers_resolves_functions(self, daemon):
+        blk = _find_block(daemon, ".got.plt")
+        n = blk["size"] // 8
+        pointers = rpc(daemon["sock"], "read_pointers", {
+            "binary": daemon["short_name"], "address": blk["start"], "count": n,
+        })["result"]["pointers"]
+
+        names = {p["target_name"] for p in pointers if p["target_name"]}
+        assert names & self._LIBC, (
+            f"expected a resolved libc import among {self._LIBC}; got {names}"
+        )
+        # .got.plt has NULL slots — they must be reported unresolved, not crash.
+        zeros = [p for p in pointers if p["value"] == "0x0"]
+        assert zeros, f"expected at least one NULL slot in .got.plt: {pointers}"
+        assert all(p["target_address"] is None for p in zeros), zeros
+
+    def test_read_pointers_pointer_size_override(self, daemon):
+        blk = _find_block(daemon, ".got.plt")
+        result = rpc(daemon["sock"], "read_pointers", {
+            "binary": daemon["short_name"], "address": blk["start"],
+            "count": 4, "pointer_size": 4,
+        })["result"]
+        assert result["pointer_size"] == 4, result
+        assert result["count"] == 4, result
+
+    def test_read_pointers_unmapped_errors(self, daemon):
+        from ghidra_rpc.client import DaemonError, send_request
+        try:
+            send_request(daemon["sock"], "read_pointers", {
+                "binary": daemon["short_name"],
+                "address": "0x7ffffff00000", "count": 4,
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected DaemonError for unmapped address")
+        except DaemonError as exc:
+            assert exc.error in ("ValueError", "RuntimeError", "Exception"), exc
+
+
+# ── 18. List vtable ─────────────────────────────────────────────────────────
+
+class TestListVtable:
+    """Integration tests for ``list_vtable``.
+
+    testapp is C (no real C++ vtables), so these exercise the mechanics against
+    ``.got.plt`` — a genuine table of function pointers — plus start-address
+    resolution and termination behaviour.
+    """
+
+    _LIBC = {"free", "strlen", "printf", "malloc", "fwrite"}
+
+    def _first_function_slot(self, daemon):
+        """Return the (0x-prefixed) address of the first function pointer in
+        .got.plt, using read_pointers to locate it."""
+        blk = _find_block(daemon, ".got.plt")
+        n = blk["size"] // 8
+        pointers = rpc(daemon["sock"], "read_pointers", {
+            "binary": daemon["short_name"], "address": blk["start"], "count": n,
+        })["result"]["pointers"]
+        slot = next((p for p in pointers if p["target_kind"] == "function"), None)
+        if slot is None:
+            pytest.skip("no function pointer found in .got.plt")
+        return f"0x{slot['slot_address']}"
+
+    def test_list_vtable_count_path(self, daemon):
+        """With --count, read exactly N slots and stop with reason 'count'."""
+        blk = _find_block(daemon, ".got.plt")
+        n = blk["size"] // 8
+        result = rpc(daemon["sock"], "list_vtable", {
+            "binary": daemon["short_name"], "address": f"0x{blk['start']}",
+            "count": n,
+        })["result"]
+
+        assert result["stopped_reason"] == "count", result
+        assert result["count"] == n, result
+        names = {s["target_name"] for s in result["slots"] if s["target_name"]}
+        assert names & self._LIBC, (
+            f"expected resolved libc functions in the table; got {names}"
+        )
+
+    def test_list_vtable_auto_termination(self, daemon):
+        """Without --count, walk function pointers and stop at a boundary."""
+        start = self._first_function_slot(daemon)
+        result = rpc(daemon["sock"], "list_vtable", {
+            "binary": daemon["short_name"], "address": start,
+        })["result"]
+
+        assert result["count"] >= 1, result
+        assert result["slots"][0]["target_kind"] == "function", result
+        assert result["stopped_reason"] in (
+            "non_function_pointer", "next_vtable_symbol", "unreadable", "cap",
+        ), result
+
+    def test_list_vtable_resolves_start_by_name(self, daemon):
+        """The start argument may be a function/symbol name, not just an address."""
+        # 'main' resolves via the function table to its entry point.
+        main_addr = rpc(daemon["sock"], "decompile", {
+            "binary": daemon["short_name"], "func": "main",
+        })["result"]["address"]
+
+        result = rpc(daemon["sock"], "list_vtable", {
+            "binary": daemon["short_name"], "address": "main",
+        })["result"]
+        assert result["vtable_address"] == main_addr, (
+            f"start-by-name should resolve to main's entry {main_addr}; "
+            f"got {result['vtable_address']}"
+        )
+
+    def test_list_vtable_bad_target_errors(self, daemon):
+        from ghidra_rpc.client import DaemonError, send_request
+        try:
+            send_request(daemon["sock"], "list_vtable", {
+                "binary": daemon["short_name"],
+                "address": "__no_such_symbol_or_addr__",
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected DaemonError for unresolvable target")
+        except DaemonError as exc:
+            assert exc.error in ("ValueError", "RuntimeError", "Exception"), exc

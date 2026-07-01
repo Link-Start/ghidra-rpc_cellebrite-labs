@@ -22,3 +22,4 @@ def register_all_tools():
     from ghidra_rpc.server.tools import tags
     from ghidra_rpc.server.tools import version_tracking
     from ghidra_rpc.server.tools import processor_context
+    from ghidra_rpc.server.tools import cpp

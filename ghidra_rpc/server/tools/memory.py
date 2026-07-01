@@ -59,6 +59,132 @@ def _handle_read_bytes(ctx, args: dict) -> dict:
     }
 
 
+_MAX_POINTERS = 4096  # hard cap on pointers per read-pointers request
+
+
+def resolve_target_name(program, addr):
+    """Best-effort symbol name for a target address.
+
+    Returns ``(name, kind)`` where ``kind`` is one of ``"function"``,
+    ``"function_interior"``, a Ghidra symbol-type string, or ``None`` when the
+    address carries no symbol.  Prefers a function at the exact address (the
+    common case for vtable slots and call targets).
+    """
+    fm = program.getFunctionManager()
+    func = fm.getFunctionAt(addr)
+    if func is not None:
+        return str(func.getName()), "function"
+
+    sym = program.getSymbolTable().getPrimarySymbol(addr)
+    if sym is not None:
+        return str(sym.getName()), str(sym.getSymbolType())
+
+    containing = fm.getFunctionContaining(addr)
+    if containing is not None:
+        delta = addr.subtract(containing.getEntryPoint())
+        return f"{containing.getName()}+0x{delta:x}", "function_interior"
+
+    return None, None
+
+
+def _handle_read_pointers(ctx, args: dict) -> dict:
+    """Read a table of pointers and resolve each to its symbol.
+
+    Reads ``count`` pointer-sized words starting at ``address`` (respecting the
+    program's endianness and default pointer size) and resolves each value to a
+    function/symbol name where possible.  Useful for vtables, import tables,
+    jump tables, and RTTI pointer arrays.
+
+    Args (in ``args`` dict):
+        binary       -- program name / key
+        address      -- hex address of the first pointer
+        count        -- number of pointers to read (1 .. 4096)
+        pointer_size -- override pointer width in bytes (1/2/4/8);
+                        default = program's default pointer size
+
+    Returns a dict with:
+        address, count, pointer_size, endian
+        pointers -- list of {index, offset, slot_address, value,
+                    target_address, target_name, target_kind}
+    """
+    from ghidra_rpc.server.context import _parse_address
+
+    binary      = args.get("binary", "")
+    address_str = args.get("address", "")
+    count       = args.get("count")
+    ptr_size    = args.get("pointer_size")
+
+    if not address_str:
+        raise ValueError("Missing required argument: address")
+    if count is None:
+        raise ValueError("Missing required argument: count")
+
+    count = int(count)
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    if count > _MAX_POINTERS:
+        raise ValueError(f"count must be <= {_MAX_POINTERS} (requested {count})")
+
+    pi      = ctx.get_program(binary)
+    program = pi.program
+    addr    = _parse_address(program, address_str)
+
+    if ptr_size is None:
+        ptr_size = int(program.getDefaultPointerSize())
+    else:
+        ptr_size = int(ptr_size)
+        if ptr_size not in (1, 2, 4, 8):
+            raise ValueError("pointer_size must be one of 1, 2, 4, 8")
+
+    big_endian = bool(program.getLanguage().isBigEndian())
+    total      = count * ptr_size
+    try:
+        raw = pi.flat_api.getBytes(addr, total)
+    except Exception as e:
+        raise ValueError(f"Memory read failed at {addr} (len {total}): {e}")
+    data = bytes(b & 0xFF for b in raw)
+
+    default_space = program.getAddressFactory().getDefaultAddressSpace()
+    memory        = program.getMemory()
+    byteorder     = "big" if big_endian else "little"
+
+    pointers = []
+    for i in range(count):
+        chunk = data[i * ptr_size:(i + 1) * ptr_size]
+        value = int.from_bytes(chunk, byteorder)
+        slot_addr = addr.add(i * ptr_size)
+
+        target_address = None
+        target_name = None
+        target_kind = None
+        if value != 0:
+            try:
+                tgt = default_space.getAddress(value)
+            except Exception:
+                tgt = None
+            if tgt is not None and memory.contains(tgt):
+                target_address = str(tgt)
+                target_name, target_kind = resolve_target_name(program, tgt)
+
+        pointers.append({
+            "index":          i,
+            "offset":         i * ptr_size,
+            "slot_address":   str(slot_addr),
+            "value":          f"0x{value:x}",
+            "target_address": target_address,
+            "target_name":    target_name,
+            "target_kind":    target_kind,
+        })
+
+    return {
+        "address":      str(addr),
+        "count":        count,
+        "pointer_size": ptr_size,
+        "endian":       byteorder,
+        "pointers":     pointers,
+    }
+
+
 def _format_hexdump(start_addr, data: bytes, width: int = 16) -> str:
     """Return a classic hex+ASCII dump string.
 
@@ -238,5 +364,6 @@ def _handle_write_bytes(ctx, args: dict) -> dict:
 
 
 register_handler("read_bytes", _handle_read_bytes)
+register_handler("read_pointers", _handle_read_pointers)
 register_handler("write_bytes", _handle_write_bytes)
 register_handler("memory_map", _handle_memory_map)

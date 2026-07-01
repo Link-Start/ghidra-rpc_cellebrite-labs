@@ -4,6 +4,12 @@
 
 ### Added
 
+- `read-pointers` command: read N pointer-sized words at an address and resolve
+  each to its function/symbol (respecting endianness and pointer size). Useful for
+  vtables, import/jump tables, and RTTI pointer arrays.
+- `list-vtable` command: dump a C++ vtable's slots as resolved methods. Accepts a
+  symbol name or address; without an explicit count it stops at the next vftable
+  symbol or the first non-function pointer, reporting `stopped_reason`.
 - `batch-edit-variable` command: rename and/or retype many local variables in a
   single decompiler snapshot and one transaction. Fixes the auto-name renumbering
   that breaks chained single `rename-variable`/`retype-variable` calls, and lets you
