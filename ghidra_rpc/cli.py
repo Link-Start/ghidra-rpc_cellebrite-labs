@@ -1002,7 +1002,14 @@ def save_program(binary: str, project: str | None):
 @cli.command(name="create-struct")
 @click.argument("binary")
 @click.argument("struct_name")
-@click.argument("fields", nargs=-1, required=True)
+@click.argument("fields", nargs=-1, required=False)
+@click.option(
+    "--field", "explicit_fields", multiple=True, nargs=3,
+    metavar="OFFSET TYPE NAME",
+    help="Field at an explicit byte OFFSET (decimal or 0x hex), repeatable. "
+         "Gaps between fields are auto-padded. Mutually exclusive with the "
+         "positional TYPE NAME pairs.",
+)
 @click.option(
     "--if-not-exists", "if_not_exists", is_flag=True, default=False,
     help="If a struct with this name already exists, return it without error "
@@ -1015,17 +1022,21 @@ def save_program(binary: str, project: str | None):
 )
 @click.option("--project", "-p", type=str, help="Path to .gpr project file")
 def create_struct(
-    binary: str, struct_name: str, fields: tuple,
+    binary: str, struct_name: str, fields: tuple, explicit_fields: tuple,
     if_not_exists: bool, or_replace: bool, project: str | None
 ):
     """Create a named struct type in the program's data type manager.
 
-    FIELDS is a flat list of alternating TYPE NAME pairs:
+    Two layouts:
 
-      ghidra-rpc create-struct <binary> <struct_name> TYPE1 FIELD1 TYPE2 FIELD2 ...
-
-    Example:
+    \b
+    Sequential — FIELDS is a flat list of alternating TYPE NAME pairs:
       ghidra-rpc create-struct binary ErrorEntry int errorNumber "char *" ptrErrorMsg
+
+    \b
+    Explicit offsets — repeat --field OFFSET TYPE NAME; gaps auto-pad:
+      ghidra-rpc create-struct binary Split \\
+        --field 0x00 int time --field 0x10 "FixedIntervalData *" data
 
     Once created, the struct is available by name for set-data-type and
     apply-data-type-range (e.g. ErrorEntry, ErrorEntry[4], ErrorEntry *).
@@ -1036,17 +1047,41 @@ def create_struct(
     if the name is already taken).  Use --or-replace to delete the existing
     struct and recreate it with the new field layout.
     """
-    if len(fields) % 2 != 0:
+    if fields and explicit_fields:
         click.echo(
-            "Error: FIELDS must be pairs of TYPE NAME "
-            f"(got {len(fields)} token(s)).",
+            "Error: use either positional TYPE NAME pairs or --field "
+            "OFFSET TYPE NAME, not both.",
             err=True,
         )
         sys.exit(1)
-    field_list = [
-        {"type": fields[i], "name": fields[i + 1]}
-        for i in range(0, len(fields), 2)
-    ]
+
+    if explicit_fields:
+        field_list = [
+            {"offset": off, "type": ftype, "name": fname}
+            for (off, ftype, fname) in explicit_fields
+        ]
+    elif fields:
+        if len(fields) % 2 != 0:
+            click.echo(
+                "Error: FIELDS must be pairs of TYPE NAME "
+                f"(got {len(fields)} token(s)).",
+                err=True,
+            )
+            sys.exit(1)
+        field_list = [
+            {"type": fields[i], "name": fields[i + 1]}
+            for i in range(0, len(fields), 2)
+        ]
+    elif if_not_exists:
+        field_list = []  # allowed: idempotent lookup of an existing struct
+    else:
+        click.echo(
+            "Error: provide fields as positional TYPE NAME pairs or "
+            "--field OFFSET TYPE NAME.",
+            err=True,
+        )
+        sys.exit(1)
+
     _rpc_command(_resolve_project(project), "create_struct", {
         "binary": binary, "name": struct_name, "fields": field_list,
         "if_not_exists": if_not_exists, "or_replace": or_replace,

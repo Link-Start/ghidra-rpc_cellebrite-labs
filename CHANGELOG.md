@@ -4,6 +4,11 @@
 
 ### Added
 
+- `create-struct` explicit-offset layout: pass `--field OFFSET TYPE NAME`
+  (repeatable; OFFSET is decimal or `0x` hex) to place fields at exact byte
+  offsets. Gaps are auto-padded with undefined bytes — no manual pad fields —
+  and overlapping fields are rejected. The original sequential `TYPE NAME`
+  form is unchanged.
 - `read-pointers` command: read N pointer-sized words at an address and resolve
   each to its function/symbol (respecting endianness and pointer size). Useful for
   vtables, import/jump tables, and RTTI pointer arrays.

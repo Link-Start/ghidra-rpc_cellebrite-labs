@@ -19,12 +19,27 @@ from ghidra_rpc.server.tools.modifications import (
 
 # ── create-struct ─────────────────────────────────────────────────────────────
 
+def _coerce_offset(value):
+    """Coerce a field offset to int, accepting decimal or ``0x`` hex strings."""
+    if isinstance(value, str):
+        return int(value, 0)
+    return int(value)
+
+
 def _handle_create_struct(ctx, args: dict) -> dict:
     """Create a named structure data type in the program's data type manager.
 
     ``fields`` is a list of ``{"type": "<type_str>", "name": "<field_name>"}``
     dicts.  All the same type expressions accepted by ``set-data-type`` are
     valid for field types (``int``, ``char *``, ``MyStruct``, …).
+
+    Two layout modes:
+    - **Sequential** (default): fields are packed end-to-end in list order.
+    - **Explicit offsets**: if any field carries an ``"offset"`` (int, or a
+      decimal/``0x`` hex string) the struct is laid out at those byte offsets
+      and the gaps between fields are auto-padded with undefined bytes — no
+      manual ``pad`` fields needed.  In this mode *every* field must have an
+      offset, and overlapping fields are rejected.
 
     Dynamic-length types (``string``, ``unicode``) are not allowed as struct
     fields; use a pointer (``char *``) instead.
@@ -51,10 +66,15 @@ def _handle_create_struct(ctx, args: dict) -> dict:
     pi = ctx.get_program(binary)
 
     def _summarise(dt):
-        """Return a field summary list from any StructureDataType."""
+        """Return a field summary list from any StructureDataType.
+
+        Uses ``getDefinedComponents()`` so auto-pad gaps (undefined filler in an
+        explicit-offset layout) are omitted — only the real fields are reported.
+        For a gap-free sequential struct this is identical to listing every
+        component.
+        """
         summary = []
-        for i in range(dt.getNumComponents()):
-            comp = dt.getComponent(i)
+        for comp in dt.getDefinedComponents():
             summary.append({
                 "offset":    comp.getOffset(),
                 "name":      str(comp.getFieldName() or ""),
@@ -107,32 +127,119 @@ def _handle_create_struct(ctx, args: dict) -> dict:
         # deadlock that a two-transaction approach (add empty / add fields)
         # would have caused.
 
+        def _resolve_field(fld):
+            """Resolve a field's type; return (fdt, flen, fname). Validates."""
+            ftype = fld.get("type", "")
+            fname = fld.get("name", "")
+            if not ftype or not fname:
+                raise ValueError(f"Each field must have 'type' and 'name': {fld}")
+            fdt = _resolve_data_type(pi.program, ftype)
+            flen = fdt.getLength()
+            if flen <= 0:
+                raise ValueError(
+                    f"Field '{fname}' has type '{ftype}' which is "
+                    f"dynamic-length and cannot be a struct field directly. "
+                    f"Use a pointer ('{ftype} *') or a fixed-length alternative."
+                )
+            return fdt, flen, fname
+
         def _build_struct():
             # Register empty placeholder, get the mutable DTM-managed instance.
             placeholder = StructureDataType(CategoryPath.ROOT, struct_name, 0, dtm)
             resolved = dtm.addDataType(placeholder, DataTypeConflictHandler.REPLACE_HANDLER)
 
-            # Add fields to the resolved (DTM-managed, mutable) struct.
+            # Add fields sequentially (packed end-to-end, no gaps).
             for fld in fields:
+                fdt, flen, fname = _resolve_field(fld)
+                resolved.add(fdt, flen, fname, "")
+            return resolved
+
+        def _validate_explicit():
+            """Validate the explicit-offset layout WITHOUT touching the DTM.
+
+            Runs before any transaction opens: a create that fails inside a
+            transaction leaves the transaction machinery in a state that makes
+            the *next* write command silently fail to commit, so all input that
+            can be rejected (bad types, offsets, overlaps) must be rejected here.
+            Self-referential pointer fields ("MyStruct *") can't be resolved
+            until the placeholder exists — detect them by name and defer
+            resolution to the apply step, using the pointer size for the overlap
+            check now.  Returns ``(entries, total)``.
+            """
+            ptr_size = pi.program.getDefaultPointerSize()
+            entries = []  # (offset, fname, flen, fdt_or_None, ftype)
+            for fld in fields:
+                if fld.get("offset") is None:
+                    raise ValueError(
+                        "In explicit-offset mode every field must have an "
+                        f"'offset' (missing on: {fld})."
+                    )
+                try:
+                    off = _coerce_offset(fld["offset"])
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Invalid offset {fld['offset']!r} in field {fld}."
+                    )
+                if off < 0:
+                    raise ValueError(
+                        f"Field '{fld.get('name')}' has a negative offset {off}."
+                    )
                 ftype = fld.get("type", "")
                 fname = fld.get("name", "")
                 if not ftype or not fname:
                     raise ValueError(f"Each field must have 'type' and 'name': {fld}")
-                fdt = _resolve_data_type(pi.program, ftype)
-                flen = fdt.getLength()
-                if flen <= 0:
+
+                # Pointer to the struct being defined -> resolve later.
+                if ftype.rstrip().endswith("*") and \
+                        ftype.rstrip().rstrip("*").strip() == struct_name:
+                    entries.append((off, fname, ptr_size, None, ftype))
+                else:
+                    fdt, flen, _ = _resolve_field(fld)
+                    entries.append((off, fname, flen, fdt, ftype))
+
+            # Detect overlaps so a mistaken layout fails loudly rather than
+            # silently clobbering an adjacent field.
+            entries.sort(key=lambda e: e[0])
+            for i in range(len(entries) - 1):
+                end = entries[i][0] + entries[i][2]
+                if end > entries[i + 1][0]:
                     raise ValueError(
-                        f"Field '{fname}' has type '{ftype}' which is "
-                        f"dynamic-length and cannot be a struct field directly. "
-                        f"Use a pointer ('{ftype} *') or a fixed-length alternative."
+                        f"Field '{entries[i][1]}' (offset {entries[i][0]}, "
+                        f"size {entries[i][2]}) overlaps field "
+                        f"'{entries[i + 1][1]}' at offset {entries[i + 1][0]}."
                     )
-                resolved.add(fdt, flen, fname, "")
+            total = max(off + flen for (off, _, flen, _, _) in entries)
+            return entries, total
+
+        def _apply_explicit(entries, total):
+            """Build the struct from a pre-validated layout (inside a tx)."""
+            placeholder = StructureDataType(CategoryPath.ROOT, struct_name, 0, dtm)
+            resolved = dtm.addDataType(placeholder, DataTypeConflictHandler.REPLACE_HANDLER)
+
+            # A freshly created empty Ghidra structure reports getLength()==1
+            # but holds zero addressable bytes, so a single grow-by-delta can
+            # come up one byte short.  Loop until it actually covers `total`.
+            while resolved.getLength() < total:
+                resolved.growStructure(total - resolved.getLength())
+            for (off, fname, flen, fdt, ftype) in entries:
+                if fdt is None:  # deferred self-referential pointer
+                    fdt = _resolve_data_type(pi.program, ftype)
+                    flen = fdt.getLength()
+                resolved.replaceAtOffset(off, fdt, flen, fname, "")
             return resolved
+
+        explicit = any(fld.get("offset") is not None for fld in fields)
+
+        # Validate the explicit layout BEFORE opening a transaction so a bad
+        # layout can't leave the transaction machinery wedged for the next
+        # command.
+        explicit_layout = _validate_explicit() if explicit else None
 
         with ghidra_transaction(
             pi.program, f"ghidra-rpc: create struct {struct_name}"
         ):
-            added = _build_struct()
+            added = (_apply_explicit(*explicit_layout) if explicit
+                     else _build_struct())
 
         return {
             "name":            str(added.getName()),

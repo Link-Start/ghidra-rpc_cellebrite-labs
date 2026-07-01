@@ -1058,6 +1058,83 @@ class TestDataTypes:
             })["result"]
             assert result["name"] == name
 
+    def test_create_struct_explicit_offsets(self, daemon):
+        """Fields at explicit offsets auto-pad the gaps; only real fields listed."""
+        uid  = uuid.uuid4().hex[:8]
+        name = f"OffsetStruct_{uid}"
+
+        result = rpc(daemon["sock"], "create_struct", {
+            "binary": daemon["short_name"], "name": name,
+            "fields": [
+                {"offset": 0,    "type": "int", "name": "time"},
+                {"offset": 0x10, "type": "int", "name": "watts"},
+            ],
+        })["result"]
+
+        # Gap between the two fields is auto-padded, not reported as a field.
+        assert len(result["fields"]) == 2, result
+        by_off = {f["offset"]: f for f in result["fields"]}
+        assert set(by_off) == {0, 16}, result
+        assert by_off[0]["name"] == "time"
+        assert by_off[16]["name"] == "watts"
+        # Struct spans through the last field: 0x10 + sizeof(int) = 0x14.
+        assert result["size"] == 0x14, result
+
+    def test_create_struct_explicit_hex_string_offset(self, daemon):
+        """Offsets may be 0x-hex strings (as the CLI passes them)."""
+        uid  = uuid.uuid4().hex[:8]
+        name = f"HexOffStruct_{uid}"
+
+        result = rpc(daemon["sock"], "create_struct", {
+            "binary": daemon["short_name"], "name": name,
+            "fields": [
+                {"offset": "0x0", "type": "int",    "name": "a"},
+                {"offset": "0x8", "type": "char *", "name": "p"},
+            ],
+        })["result"]
+
+        by_off = {f["offset"]: f for f in result["fields"]}
+        assert set(by_off) == {0, 8}, result
+        assert by_off[8]["name"] == "p"
+
+    def test_create_struct_explicit_self_referential(self, daemon):
+        """A pointer to the struct being defined resolves (deferred resolution)."""
+        uid  = uuid.uuid4().hex[:8]
+        name = f"Node_{uid}"
+
+        result = rpc(daemon["sock"], "create_struct", {
+            "binary": daemon["short_name"], "name": name,
+            "fields": [
+                {"offset": 0, "type": "int",       "name": "val"},
+                {"offset": 8, "type": f"{name} *", "name": "next"},
+            ],
+        })["result"]
+
+        by_off = {f["offset"]: f for f in result["fields"]}
+        assert set(by_off) == {0, 8}, result
+        assert by_off[8]["name"] == "next", result
+        assert "*" in by_off[8]["data_type"], result  # a pointer type
+        assert result["size"] == 0x10, result
+
+    def test_create_struct_explicit_overlap_rejected(self, daemon):
+        """Overlapping explicit offsets must fail loudly, not clobber silently."""
+        from ghidra_rpc.client import DaemonError, send_request
+        uid  = uuid.uuid4().hex[:8]
+        name = f"OverlapStruct_{uid}"
+
+        try:
+            send_request(daemon["sock"], "create_struct", {
+                "binary": daemon["short_name"], "name": name,
+                "fields": [
+                    {"offset": 0, "type": "int", "name": "a"},   # bytes 0..3
+                    {"offset": 2, "type": "int", "name": "b"},   # bytes 2..5 — overlaps a
+                ],
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected DaemonError for overlapping fields")
+        except DaemonError as exc:
+            assert exc.error == "ValueError", exc
+            assert "overlap" in str(exc).lower(), exc
+
     def test_create_enum(self, daemon):
         uid  = uuid.uuid4().hex[:8]
         name = f"TestEnum_{uid}"
