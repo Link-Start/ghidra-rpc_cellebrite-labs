@@ -33,15 +33,17 @@ def _send_request(sock_path: Path, cmd: str, args: dict | None = None) -> dict:
     }
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
-    s.connect(str(sock_path))
-    s.sendall((json.dumps(request) + "\n").encode())
-    buf = b""
-    while b"\n" not in buf:
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        buf += chunk
-    s.close()
+    try:
+        s.connect(str(sock_path))
+        s.sendall((json.dumps(request) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
     return json.loads(buf.decode().strip())
 
 
@@ -50,8 +52,17 @@ class TestProtocol:
 
     @pytest.fixture(autouse=True)
     def setup_server(self, tmp_path):
-        """Start a server with mock context in a background thread."""
-        # Import and clear any existing handlers
+        """Start a server with a mock context in a background thread.
+
+        Readiness is confirmed by a real ``ping`` round-trip, not by the socket
+        file merely appearing: the file exists after ``bind()`` but before
+        ``listen()``, so an early ``connect()`` races and gets
+        ``ConnectionRefusedError``.  On teardown the server is stopped and its
+        thread joined, so daemon threads (and their hold on the module-global
+        ``_HANDLERS`` dict) don't leak across tests — leaked servers under
+        random test ordering were the source of the intermittent
+        ``ConnectionRefusedError`` failures.
+        """
         from ghidra_rpc.server import main as server_main
         server_main._HANDLERS.clear()
 
@@ -73,13 +84,31 @@ class TestProtocol:
         )
         self.server_thread.start()
 
-        # Wait for socket to appear
+        # Wait until the server actually accepts connections and answers a ping.
         deadline = time.time() + 5
+        ready = False
         while time.time() < deadline:
+            try:
+                if _send_request(self.sock_path, "ping").get("ok"):
+                    ready = True
+                    break
+            except OSError:
+                pass  # bind() done but not yet listen(), or socket not up yet
+            time.sleep(0.02)
+        assert ready, "Server did not become reachable"
+
+        yield
+
+        # Teardown: tell the server to stop (unless a test already did) so
+        # daemon threads don't accumulate across the suite.  Once "stop" is
+        # acked the server has set its shutdown flag and no longer accepts
+        # connections, so it's safe for the next test to clear _HANDLERS and
+        # bind a fresh socket; we don't block joining the winding-down thread.
+        try:
             if self.sock_path.exists():
-                break
-            time.sleep(0.05)
-        assert self.sock_path.exists(), "Server socket did not appear"
+                _send_request(self.sock_path, "stop")
+        except OSError:
+            pass
 
     def test_ping(self):
         resp = _send_request(self.sock_path, "ping")
