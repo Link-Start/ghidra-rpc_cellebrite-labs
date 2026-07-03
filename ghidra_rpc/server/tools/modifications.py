@@ -1408,26 +1408,46 @@ def _handle_list_namespaces(ctx, args: dict) -> dict:
         st = pi.program.getSymbolTable()
         namespaces = []
 
-        # Iterate all namespace symbols
-        for sym in st.getSymbolIterator():
-            if sym.getSymbolType() == SymbolType.NAMESPACE or \
-               sym.getSymbolType() == SymbolType.CLASS:
-                ns = sym.getObject()
-                # Count children
-                child_count = 0
-                child_iter = st.getChildren(sym)
-                for _ in child_iter:
-                    child_count += 1
+        # Walk the namespace tree from the global namespace via getChildren().
+        #
+        # We deliberately do NOT use getSymbolIterator(): that iterator only
+        # yields *memory-location labels*, so it misses namespace/class symbols
+        # that have no memory address.  This is exactly the case for DEX/Dalvik
+        # programs, whose package namespaces (createNameSpace) and class
+        # namespaces (createClass) are not memory labels -- the old scan
+        # returned an empty list for every DEX program even though thousands of
+        # class namespaces existed.  A tree walk from the global namespace works
+        # uniformly for native (ELF/PE) and DEX programs alike.
+        seen_ids = set()
+        global_sym = pi.program.getGlobalNamespace().getSymbol()
+        # LIFO stack of parent namespace symbols still to expand.
+        stack = [global_sym]
+        is_root = True
+        while stack and len(namespaces) < limit:
+            parent_sym = stack.pop()
+            child_count = 0
+            child_namespaces = []
+            for child in st.getChildren(parent_sym):
+                child_count += 1
+                st_type = child.getSymbolType()
+                if (st_type == SymbolType.NAMESPACE or st_type == SymbolType.CLASS) \
+                        and child.getID() not in seen_ids:
+                    seen_ids.add(child.getID())
+                    child_namespaces.append(child)
 
+            # Record every namespace except the global root, using the child
+            # count we just computed while expanding it.
+            if not is_root:
+                ns = parent_sym.getObject()
                 namespaces.append({
-                    "name":         str(sym.getName()),
-                    "path":         str(ns.getName(True)) if ns else str(sym.getName()),
-                    "id":           int(sym.getID()),
-                    "type":         str(sym.getSymbolType()),
+                    "name":         str(parent_sym.getName()),
+                    "path":         str(ns.getName(True)) if ns else str(parent_sym.getName()),
+                    "id":           int(parent_sym.getID()),
+                    "type":         str(parent_sym.getSymbolType()),
                     "symbol_count": child_count,
                 })
-                if len(namespaces) >= limit:
-                    break
+            is_root = False
+            stack.extend(child_namespaces)
 
         return {
             "namespaces": namespaces,

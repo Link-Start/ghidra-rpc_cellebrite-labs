@@ -15,7 +15,7 @@ ghidra-rpc/
 ├── package.json          — pi package metadata
 ├── pyproject.toml        — Python package config (entry points, deps)
 ├── README.md             — Human-facing overview
-├── TODO.md               — Open bugs, open features, verified-working table
+├── CHANGELOG.md          — Notable changes per release (Keep a Changelog format)
 │
 ├── docs/                 — Extended documentation (loaded on demand from SKILL.md)
 │   ├── install.md        — Prerequisites, installation, GHIDRA_INSTALL_DIR setup
@@ -25,9 +25,9 @@ ghidra-rpc/
 │   │                        Ghidra API reference, background-start mechanics
 │   └── flows/            — Workflow guides for specific RE tasks
 │       ├── binary-audit.md
-│       ├── multi-binary.md
 │       ├── patch-analysis.md
-│       └── vulnerability-research.md
+│       ├── vulnerability-research.md
+│       └── android-apk.md   — APK/DEX (Dalvik) loading + multi-dex caveat
 │
 ├── ghidra_rpc/           — Python package
 │   ├── __init__.py       — Version
@@ -61,9 +61,12 @@ ghidra-rpc/
 │           ├── xrefs.py        — xrefs_to, xrefs_from
 │           ├── navigation.py   — goto (GUI-only)
 │           ├── bookmarks.py    — set_bookmark, list_bookmarks, remove_bookmark
-│           ├── memory.py       — read_bytes (raw memory inspection),
+│           ├── memory.py       — read_bytes (raw memory inspection), read_pointers
+│           │                     (read + symbol-resolve a pointer table),
 │           │                     write_bytes (raw memory patching),
 │           │                     memory_map (list all memory segments/sections)
+│           ├── cpp.py          — list_vtable (walk a vtable, resolve slots to
+│           │                     methods; builds on read_pointers + xrefs)
 │           ├── disassembly.py  — disassemble (warning field when address skipped),
 │           │                     assemble (SLEIGH assembler: text → bytes)
 │           ├── cfg.py          — basic_blocks (CFG from BasicBlockModel),
@@ -90,6 +93,8 @@ ghidra-rpc/
 │                                  batch_set_comment (many comments, one tx),
 │                                  set_function_signature, set_data_type,
 │                                  retype_variable (with --timeout), rename_variable (with --timeout),
+│                                  batch_edit_variables (rename/retype many locals
+│                                    against one decompiler snapshot),
 │                                  set_calling_convention, set_thunk, set_flow_override,
 │                                  create_namespace, list_namespaces
 │                                  _resolve_data_type() — type-name → Ghidra DataType
@@ -101,11 +106,15 @@ ghidra-rpc/
     ├── test_protocol.py         — Wire protocol tests (no Ghidra needed)
     ├── test_client.py           — Client + session tests (no Ghidra needed)
     ├── test_session_registry.py — Registry, discover-instances, list-instances CLI
-    └── test_integration.py      — End-to-end integration tests against a real headless
-                                   Ghidra daemon loading /usr/bin/ls; 69 tests covering
-                                   every API domain.  Skipped unless GHIDRA_INSTALL_DIR
-                                   is set.  Uses a single module-scoped daemon fixture
-                                   so Ghidra starts only once per pytest run.
+    ├── test_integration.py      — End-to-end integration tests against a real headless
+    │                              Ghidra daemon loading tests/fixtures/testapp, covering
+    │                              every API domain.  Skipped unless GHIDRA_INSTALL_DIR is
+    │                              set.  Uses a single module-scoped daemon fixture so
+    │                              Ghidra starts only once per pytest run.
+    └── fixtures/                — testapp (x86-64 ELF) + testapp.c, the committed test
+                                    binary loaded by test_integration.py, plus
+                                    dex/ (two real-world DEX fixtures for
+                                    Dalvik-specific behavior; see fixtures/README.md)
 ```
 
 ## Architecture
@@ -202,7 +211,7 @@ python -m pytest tests/test_protocol.py tests/test_client.py tests/test_session_
 
 ### Running Integration Tests (requires Ghidra)
 ```bash
-# Starts a real headless daemon, loads /usr/bin/ls, exercises all 69 API tests.
+# Starts a real headless daemon, loads tests/fixtures/testapp, exercises every API domain.
 # First run is slow (JVM + analysis); budget ~10 min on a typical laptop.
 GHIDRA_INSTALL_DIR=/path/to/ghidra pytest tests/test_integration.py -v
 ```
@@ -241,11 +250,3 @@ uv run ghidra-rpc decompile ls main
 
 > For more detail on all gotchas plus the Ghidra API reference and session/daemon
 > internals, read **`docs/internals.md`**.
-
-## What Needs Work
-
-See `TODO.md` for the authoritative list. Current open items:
-
-- `copy-annotations` between binaries.
-- Retype `this` auto-parameter in `__thiscall` functions.
-- `run-script` endpoint for GhidraScript execution.

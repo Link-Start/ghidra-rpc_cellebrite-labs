@@ -291,6 +291,18 @@ ghidra-rpc function-diff binary_v1 <func> binary_v2 <func>
 Full workflow — correlator details, unmatched analysis, bulk decompile:
 read `docs/flows/patch-analysis.md`.
 
+## Android APK / DEX Analysis
+
+Ghidra has **built-in** APK and DEX support (Dalvik processor + FileFormats
+loaders) — no extension install needed. `load` a `.dex` or `.apk` directly and
+the usual commands (`decompile`, `functions`, `strings`, `xrefs-*`, …) work on
+the Dalvik program, which decompiles to Java-like pseudocode. Note the
+**multi-dex caveat**: `load app.apk` imports only the primary `classes.dex`.
+
+For the full workflow — multi-dex extraction, class-qualified `::` symbols and
+ambiguous methods, the DEX string-vs-`xrefs-to` gotcha, minified apps, and
+manifest/`.so` extraction — read `docs/flows/android-apk.md`.
+
 ## Typical Workflow
 
 1. User starts daemon: `cd <skill-dir> && uv run ghidra-rpc start --project /path/to/project.gpr --headless`
@@ -522,6 +534,6 @@ For detailed guidance on specific workflows:
 - **Quick start tutorial**: read `docs/quickstart.md`
 - **Troubleshooting**: read `docs/troubleshooting.md`
 - **Binary audit workflow**: read `docs/flows/binary-audit.md`
-- **Multi-binary analysis**: read `docs/flows/multi-binary.md`
 - **Vulnerability research**: read `docs/flows/vulnerability-research.md`
 - **Patch/diff analysis**: read `docs/flows/patch-analysis.md`
+- **Android APK / DEX analysis**: read `docs/flows/android-apk.md`

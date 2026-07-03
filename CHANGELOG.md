@@ -2,7 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `list-namespaces` returned an empty list for DEX/Dalvik programs. The handler
+  scanned `getSymbolIterator()`, which only yields memory-location labels and so
+  missed DEX package (`createNameSpace`) and class (`createClass`) namespaces
+  — none of which are memory labels. It now walks the namespace tree from the
+  global namespace via `getChildren()`, which works uniformly for native
+  (ELF/PE) and DEX programs. Added integration regression tests
+  (`TestDexNamespaces`, `TestNamespacesNative`).
+
 ### Added
+
+- Android APK / DEX analysis guidance: new `docs/flows/android-apk.md` flow and a
+  SKILL.md section covering Ghidra's built-in Dalvik/APK/DEX loaders, the
+  class-qualified `::` symbol naming, ambiguous-method handling, the
+  **multi-dex caveat** (`load app.apk` imports only the primary `classes.dex`;
+  extract each `classes*.dex` and load them individually to cover the whole app),
+  and the DEX **string vs. symbol address** behavior (`strings` reports the
+  string-content address; use the `strings::`-labeled address from `symbols` for
+  `xrefs-to`, since the two differ by the variable-length uleb128 prefix).
 
 - `create-struct` explicit-offset layout: pass `--field OFFSET TYPE NAME`
   (repeatable; OFFSET is decimal or `0x` hex) to place fields at exact byte

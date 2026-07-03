@@ -55,6 +55,11 @@ GHIDRA_DIR = os.environ.get("GHIDRA_INSTALL_DIR")
 # The test binary lives alongside this file in tests/fixtures/
 _TEST_BINARY = Path(__file__).parent / "fixtures" / "testapp"
 
+# A small real-world DEX (Dalvik) fixture, used to exercise DEX/Android-loader
+# specific behavior (class-hierarchy namespaces) that a native ELF can't.
+# See tests/fixtures/README.md for provenance and re-download instructions.
+_DEX_BINARY = Path(__file__).parent / "fixtures" / "dex" / "detectresolution-classes.dex"
+
 pytestmark = pytest.mark.skipif(
     not GHIDRA_DIR,
     reason=(
@@ -2084,3 +2089,115 @@ class TestListVtable:
             pytest.fail("Expected DaemonError for unresolvable target")
         except DaemonError as exc:
             assert exc.error in ("ValueError", "RuntimeError", "Exception"), exc
+
+
+# ── DEX / Dalvik (Android) loader behavior ────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def dex_binary(daemon):
+    """Load the DEX fixture into the shared daemon; yield its short name.
+
+    The daemon can hold several programs at once, so we reuse the module-scoped
+    daemon (which already has ``testapp`` loaded) and add the DEX alongside it.
+    Skips the dependent tests if the fixture file is missing.
+    """
+    if not _DEX_BINARY.exists():
+        pytest.skip(f"DEX fixture not found: {_DEX_BINARY}")
+
+    resp = rpc(
+        daemon["sock"], "load",
+        {"path": str(_DEX_BINARY), "analyze": True},
+        timeout=_LOAD_TIMEOUT,
+    )
+    assert resp["ok"] is True, f"DEX load failed: {resp}"
+    return resp["result"]["short_name"]  # "detectresolution-classes.dex"
+
+
+class TestDexNamespaces:
+    """list-namespaces must work on DEX/Dalvik programs.
+
+    Regression test for the bug where ``list-namespaces`` returned an empty
+    list for every DEX program: the old implementation scanned
+    ``getSymbolIterator()``, which only yields memory-location labels and thus
+    misses DEX package (``createNameSpace``) and class (``createClass``)
+    namespaces, none of which are memory labels.  The fix walks the namespace
+    tree from the global namespace via ``getChildren()`` instead.
+    """
+
+    def test_metadata_reports_dalvik(self, daemon, dex_binary):
+        result = rpc(daemon["sock"], "metadata", {"binary": dex_binary})["result"]
+        assert result["arch"] == "Dalvik", result
+        assert "DEX" in result["format"].upper() or "DALVIK" in result["format"].upper(), result
+
+    def test_list_namespaces_not_empty(self, daemon, dex_binary):
+        result = rpc(
+            daemon["sock"], "list_namespaces",
+            {"binary": dex_binary, "limit": 100000},
+        )["result"]
+        assert result["count"] > 0, (
+            "list-namespaces returned no namespaces for a DEX program; "
+            "the getChildren() tree walk regressed back to the broken "
+            "getSymbolIterator() scan."
+        )
+        assert len(result["namespaces"]) == result["count"]
+
+    def test_list_namespaces_includes_class_and_package(self, daemon, dex_binary):
+        result = rpc(
+            daemon["sock"], "list_namespaces",
+            {"binary": dex_binary, "limit": 100000},
+        )["result"]
+        types = {n["type"] for n in result["namespaces"]}
+        # DEX produces both package Namespaces and class-hierarchy Classes.
+        assert "Class" in types, f"Expected Class namespaces, got types: {types}"
+        assert "Namespace" in types, f"Expected package Namespaces, got types: {types}"
+
+        # The app's own MainActivity class must be discoverable, as a Class,
+        # with its fully-qualified '::'-separated path.
+        paths = {n["path"] for n in result["namespaces"]}
+        assert any(
+            p.endswith("MainActivity") and p.startswith("com::")
+            for p in paths
+        ), "Expected a com::...::MainActivity Class namespace in the results"
+
+    def test_list_namespaces_entries_well_formed(self, daemon, dex_binary):
+        result = rpc(
+            daemon["sock"], "list_namespaces",
+            {"binary": dex_binary, "limit": 50},
+        )["result"]
+        assert result["namespaces"], "expected at least one namespace"
+        for ns in result["namespaces"]:
+            assert set(ns) >= {"name", "path", "id", "type", "symbol_count"}, ns
+            assert isinstance(ns["id"], int)
+            assert isinstance(ns["symbol_count"], int) and ns["symbol_count"] >= 0
+            assert ns["name"] and ns["path"]
+
+    def test_list_namespaces_respects_limit(self, daemon, dex_binary):
+        result = rpc(
+            daemon["sock"], "list_namespaces",
+            {"binary": dex_binary, "limit": 5},
+        )["result"]
+        assert result["count"] <= 5, result
+
+
+class TestNamespacesNative:
+    """list-namespaces on a native ELF: the getChildren() tree walk must still
+    find nested user-created namespaces (guards the DEX fix against regressing
+    native behavior)."""
+
+    def test_created_namespace_is_listed(self, daemon):
+        parent = "GrpcTestNsParent"
+        child = "GrpcTestNsChild"
+
+        rpc(daemon["sock"], "create_namespace",
+            {"binary": daemon["short_name"], "name": parent})
+        rpc(daemon["sock"], "create_namespace",
+            {"binary": daemon["short_name"], "name": child, "parent": parent})
+
+        result = rpc(daemon["sock"], "list_namespaces",
+                     {"binary": daemon["short_name"], "limit": 100000})["result"]
+        paths = {n["path"] for n in result["namespaces"]}
+        assert parent in paths, f"top-level namespace missing: {paths}"
+        # The nested child must be reached by the recursive tree walk.
+        assert f"{parent}::{child}" in paths, (
+            f"nested namespace not found via tree walk: {paths}"
+        )
