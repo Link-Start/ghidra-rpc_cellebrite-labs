@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- CLI usage errors (unknown options, invalid `--type`/`--mode` choices, unknown
+  subcommands, missing required arguments) previously printed a plain-text Click
+  usage string, breaking the documented "all output is JSON" contract for scripted
+  callers. `main()` now runs Click in non-standalone mode and reports these as the
+  same `{"ok": false, "error": ..., "message": ...}` envelope as RPC errors, with
+  the same exit code Click would have used. `--help`/`--version` are unaffected.
+- `list-instances`/`stop --all` globbed the *real* `/tmp` for orphaned sockets with
+  no way for tests to redirect it, so a test-invoked `stop --all` could stop a real
+  daemon running on the developer's machine (observed while testing this release).
+  The scan directory is now `cli._SOCKET_SCAN_DIR`, a module attribute tests can
+  monkeypatch to a `tmp_path`; production behaviour (`/tmp`) is unchanged.
 - `list-namespaces` returned an empty list for DEX/Dalvik programs. The handler
   scanned `getSymbolIterator()`, which only yields memory-location labels and so
   missed DEX package (`createNameSpace`) and class (`createClass`) namespaces
@@ -13,6 +24,30 @@
   (`TestDexNamespaces`, `TestNamespacesNative`).
 
 ### Added
+
+- `search-decompiled` command: regex-search decompiled C across many functions in
+  one RPC call, optionally scoped to a namespace/class with `--class`. Replaces the
+  one-RPC-per-function `symbols` + `decompile` + grep loop previously needed to find
+  which function calls a given callee, builds a given string, etc. — especially
+  valuable on multidex Android projects, where `xrefs-to` on a method only sees
+  callers within the same DEX program (see below). Bounded by `--limit` (matching
+  functions returned) and
+  `--max-scan` (functions actually decompiled, default 5000) so an unscoped sweep on
+  a 50k+-function binary can't run away; both `search-decompiled` and `decompile-all`
+  gained a `--socket-timeout` option (default 1800s) since a bulk sweep's wall-clock
+  cost scales with function count, not with the per-function `--timeout`.
+- `list-bookmarks --category`: case-insensitive substring filter on bookmark
+  category, alongside the existing `--type` filter. Helps isolate user-created
+  bookmarks from Ghidra's auto-generated `Analysis`-type ones (commonly category
+  `Address Table`), which can otherwise number in the hundreds on large/heavily
+  analyzed programs and bury a handful of user bookmarks in the default listing.
+- Documented that DEX method `xrefs-to` correctly resolves callers within the
+  same DEX program, but only sees table/`EXTERNAL` references — not real
+  callers — when every caller lives in a *different* DEX program (the common
+  multidex case). This is a general multi-binary limitation (each loaded
+  binary is an independent Ghidra `Program`), not a Dalvik-analyzer gap; the
+  same limitation previously documented only for strings/class descriptors —
+  `docs/flows/android-apk.md`.
 
 - Android APK / DEX analysis guidance: new `docs/flows/android-apk.md` flow and a
   SKILL.md section covering Ghidra's built-in Dalvik/APK/DEX loaders, the
@@ -49,6 +84,12 @@
 
 ### Changed
 
+- **Breaking:** `set-comment` now takes comment text via `--comment` instead of a
+  positional argument, matching `set-bookmark`'s `--comment` option (previously the
+  only command in the annotate-at-address family using a bare positional for the
+  same field — a natural source of `Error: No such option '--comment'`).
+  `ghidra-rpc set-comment <binary> <address> "text" --type plate` becomes
+  `ghidra-rpc set-comment <binary> <address> --comment "text" --type plate`.
 - Background daemon startup now fails fast with the captured daemon log if
   the subprocess exits early, instead of waiting out the full timeout.
 

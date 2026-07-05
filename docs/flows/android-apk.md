@@ -110,9 +110,34 @@ ghidra-rpc xrefs-to app.apk <strings::-label-address>
 Note that even with the correct address, DEX `xrefs-to` on a class/string
 typically shows only the `string_id`/`type_id` **table** reference, not the
 actual `new-instance` / `const-class` / `invoke-*` bytecode call sites — Ghidra's
-Dalvik analyzer does not build references from those. To find real usage sites,
-fall back to `functions --limit`/`symbols` filtering or decompiling candidate
-methods and searching their bodies.
+Dalvik analyzer does not build references from those.
+
+**`xrefs-to` on a *method* works correctly for callers in the same dex file.**
+Ghidra's Dalvik analyzer does resolve `invoke-*` bytecode to the real caller
+when the target method is defined in the same DEX program — `xrefs-to
+<method>` returns genuine `UNCONDITIONAL_CALL`/`CONDITIONAL_CALL` entries with
+real `from_function` names, the same as native ELF/PE.
+
+**It only degrades to table-only (`method_id` entry + `Entry Point`/`EXTERNAL`
+row, no real callers) when every caller lives in a *different* DEX program**
+(the common case in a multidex app, e.g. `classes3.dex` calling into
+`classes5.dex`). This is not a Dalvik-analyzer gap — it's the same limitation
+any multi-binary ghidra-rpc project has: each loaded binary is an independent
+Ghidra `Program` with its own database, so no single `xrefs-to` call can see
+a reference whose source and target live in two different programs. A caller
+in another dex calls through its *own* local placeholder symbol for the
+method (visible in that dex's own `symbols`/decompiled output, not the
+target dex's), so `xrefs-to <method>` on the defining dex alone will miss it.
+There is currently no cross-binary-aware `xrefs-to` in ghidra-rpc.
+
+To find real callers/usage sites in a DEX program, use `search-decompiled` to
+regex-search decompiled method bodies for the callee/class/field name across
+many functions in one call (optionally scoped with `--class`), instead of
+hand-rolling a `symbols` + `decompile` + grep loop per method:
+
+```bash
+ghidra-rpc search-decompiled app.apk "targetF1" --class com::example::Foo
+```
 
 **R8/ProGuard-minified apps** decompile fine but have obfuscated names
 (`a.b.c`). Lean on `strings`, string xrefs, and Android framework API calls

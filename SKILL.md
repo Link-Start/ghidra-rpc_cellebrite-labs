@@ -102,9 +102,17 @@ session only (daemon stopped), and `null` if no session exists.
 | `ghidra-rpc decompile <binary> <func> [--timeout SECS]` | Decompile to pseudo-C (default **120 s**) | `{name, address, signature, c_code}` |
 | `ghidra-rpc basic-blocks <binary> <func> [--limit N]` | Get basic blocks (CFG) of a function | `{name, address, blocks:[{start,end,size,instructions,successors,predecessors}], num_blocks, edges}` |
 | `ghidra-rpc pcode <binary> <func> [--high] [--timeout SECS] [--limit N]` | Get P-code (Ghidra IR); raw or high SSA form (--high) | `{name, address, mode, ops:[{address,seq,opcode,output,inputs}], count, truncated}` |
+| `ghidra-rpc search-decompiled <binary> <regex> [--class NAME] [--case-sensitive] [--limit N] [--max-scan N] [--timeout SECS] [--socket-timeout SECS]` | Regex-search decompiled C across many functions in one call (skips one-RPC-per-function `decompile`+grep loops) | `{matches:[{function,address,matching_lines:[{line,text}]}], count, functions_searched, functions_total, truncated}` |
 
 `<func>` can be a function name or hex address (e.g., `main` or `0x401000`). If the name
 is ambiguous, the error message lists matches so you can use the address instead.
+
+`search-decompiled` is especially useful on multidex Android projects, where `xrefs-to`
+on a method only sees callers within the same DEX program (see the Android APK/DEX
+section) — use it in place of a symbols+decompile+grep loop, e.g. `search-decompiled
+app.apk targetF1 --class com::example::Foo`. `--max-scan` (default 5000) bounds how many functions get decompiled
+when `--class` isn't given, so a search on a 50k+-function binary can't run away; raise
+`--socket-timeout` (default 1800s) alongside it if you do widen the scan.
 
 ### Search
 
@@ -148,7 +156,7 @@ is ambiguous, the error message lists matches so you can use the address instead
 | `ghidra-rpc rename-function <binary> <target> <new_name> [--namespace NS]` | Rename function; `--namespace` moves it into a namespace | `{address, old_name, new_name, verified[, old_namespace, new_namespace]}` |
 | `ghidra-rpc rename-symbol <binary> <address> <new_name> [--create]` | Rename symbol; `--create` makes a new label if none exists | `{address, old_name, new_name, created, verified}` |
 | `ghidra-rpc create-label <binary> <address> <name>` | Create-or-rename a label at any address (upsert) | `{address, name, old_name, action, created, verified}` |
-| `ghidra-rpc set-comment <binary> <address> <comment> [--type TYPE]` | Set comment | `{address, comment_type, comment, verified}` |
+| `ghidra-rpc set-comment <binary> <address> --comment <text> [--type TYPE]` | Set comment (comment text is `--comment`, matching `set-bookmark`) | `{address, comment_type, comment, verified}` |
 | `ghidra-rpc batch-rename <binary> --json \|--json-file FILE [--mode function\|label]` | Rename 40+ functions/labels in one transaction; per-item error reporting | `{results:[{ok, index, address, old_name, new_name}], count, ok_count, error_count}` |
 | `ghidra-rpc batch-set-comment <binary> --json \|--json-file FILE` | Set comments at many addresses in one transaction | `{results:[{ok, index, address, comment_type, comment}], count, ok_count, error_count}` |
 | `ghidra-rpc set-signature <binary> <target> <signature>` | Set function signature | `{address, old_signature, new_signature, verified}` |
@@ -192,10 +200,16 @@ instead of the volatile auto name).
 | Command | Description | Output shape |
 |---------|-------------|--------------|
 | `ghidra-rpc set-bookmark <binary> <address> [--type TYPE] [--category CAT] [--comment TEXT]` | Create/update a bookmark at an address | `{address, type, category, comment, action}` |
-| `ghidra-rpc list-bookmarks <binary> [--type TYPE] [--address ADDR] [--limit N]` | List bookmarks (all, by type, or at address) | `{bookmarks: [{address, type, category, comment}], count, total}` |
+| `ghidra-rpc list-bookmarks <binary> [--type TYPE] [--category CAT] [--address ADDR] [--limit N]` | List bookmarks (all, by type, category, or at address) | `{bookmarks: [{address, type, category, comment}], count, total}` |
 | `ghidra-rpc remove-bookmark <binary> <address> [--type TYPE] [--category CAT]` | Remove a bookmark at an address | `{address, type, removed}` |
 
 Bookmark types: `Note` (default), `Warning`, `Error`, `Info`, `Analysis`.
+
+`--category` is a case-insensitive substring filter. On heavily auto-analyzed binaries
+(large native programs, and especially DEX/Dalvik — 50k+ functions is normal), Ghidra
+generates many `Analysis`-type bookmarks (commonly category `Address Table`) that can
+bury a handful of your own; filter them out with `--category` (or `--type` to isolate
+your own type, e.g. `Note`) instead of paging through the unfiltered list.
 
 Bookmarks are visible in the Ghidra GUI's Bookmarks window. Use them to
 persistently mark interesting locations, track analysis progress, or flag
@@ -238,7 +252,11 @@ and track analysis progress.
 | `ghidra-rpc version-track <old> <new> [--changed-only] [--limit N] [--min-similarity F]` | Match functions between two versions; find what changed. Results deduplicated per source function. | `{matched:[{source_name,destination_name,similarity,confidence,correlator}], unmatched_source, unmatched_destination, summary:{source_functions_total, changed_functions, identical_functions, ...}}` |
 | `ghidra-rpc function-diff <bin1> <func1> <bin2> <func2> [--mode decompile\|disassembly]` | Unified diff of a function between two versions; normalises auto-generated names (`FUN_*`, `DAT_*`, `local_*`, `param_*`) to suppress relocation noise | `{is_identical, diff, raw_code1, raw_code2, func1_address, func2_address}` |
 | `ghidra-rpc match-function <bin1> <func> <bin2> [--threshold F]` | Find best match for a function in another binary using BSim + correlators | `{source:{name,address}, candidates:[{name,address,similarity,confidence,correlator}], count}` |
-| `ghidra-rpc decompile-all <binary> [--limit N] [--offset N] [--timeout SECS]` | Bulk decompile all functions; for export and external diff tools | `{functions:[{name,address,signature,c_code}], count, total, offset, errors}` |
+| `ghidra-rpc decompile-all <binary> [--limit N] [--offset N] [--timeout SECS] [--socket-timeout SECS]` | Bulk decompile all functions; for export and external diff tools | `{functions:[{name,address,signature,c_code}], count, total, offset, errors}` |
+
+`decompile-all`'s default `--socket-timeout` (1800s) assumes a bulk sweep can take much
+longer than any single function's `--timeout`; raise it further for binaries with tens of
+thousands of functions (e.g. large DEX/APK programs).
 
 For the full patch-diff workflow see `docs/flows/patch-analysis.md`.
 
@@ -255,6 +273,12 @@ Common errors:
   you what to do - e.g., use a more specific name or an address.
 - **RuntimeError**: Ghidra-level error. For GUI-only commands in headless mode, the error
   says so explicitly.
+
+**All CLI output is JSON, including usage errors.** A malformed invocation (unknown
+option, invalid `--type` choice, unknown subcommand, missing required argument) is also
+reported as `{"ok": false, "error": "...", "message": "..."}` on stdout, with a nonzero
+exit code — never a plain-text Click usage string. Scripted callers can always
+`json.loads()` stdout unconditionally, without special-casing argument errors.
 
 ## Write Operations & Persistence
 

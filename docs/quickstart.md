@@ -75,7 +75,7 @@ ghidra-rpc xrefs-from ls main --no-stack
 ghidra-rpc rename-function ls FUN_00401234 parse_arguments
 
 # Add a comment
-ghidra-rpc set-comment ls 0x00401234 "Parses CLI arguments" --type pre
+ghidra-rpc set-comment ls 0x00401234 --comment "Parses CLI arguments" --type pre
 ```
 
 ## 6. Stop

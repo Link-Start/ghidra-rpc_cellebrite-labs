@@ -56,11 +56,14 @@ ghidra-rpc/
 │           │                     address_min/max range filter and with_body),
 │           │                     imports, exports, metadata, relocations,
 │           │                     list_calling_conventions
-│           ├── decompiler.py   — decompile, _find_function (name/address resolution)
+│           ├── decompiler.py   — decompile, _find_function (name/address resolution),
+│           │                     search_decompiled (regex-search decompiled C across
+│           │                     many functions in one call; optional class_filter)
 │           ├── search.py       — strings, symbols, find_bytes (byte pattern search)
 │           ├── xrefs.py        — xrefs_to, xrefs_from
 │           ├── navigation.py   — goto (GUI-only)
-│           ├── bookmarks.py    — set_bookmark, list_bookmarks, remove_bookmark
+│           ├── bookmarks.py    — set_bookmark, list_bookmarks (type/category/address
+│           │                     filters), remove_bookmark
 │           ├── memory.py       — read_bytes (raw memory inspection), read_pointers
 │           │                     (read + symbol-resolve a pointer table),
 │           │                     write_bytes (raw memory patching),
@@ -106,6 +109,12 @@ ghidra-rpc/
     ├── test_protocol.py         — Wire protocol tests (no Ghidra needed)
     ├── test_client.py           — Client + session tests (no Ghidra needed)
     ├── test_session_registry.py — Registry, discover-instances, list-instances CLI
+    ├── test_cli.py              — General CLI-parsing tests (no Ghidra needed): the
+    │                              JSON-usage-error contract in main(), set-comment's
+    │                              --comment option, list-bookmarks --category
+    ├── test_search_decompiled.py — search_decompiled handler logic (regex matching,
+    │                              class_filter, limit/max_functions truncation) against
+    │                              a fully mocked program; no Ghidra needed
     ├── test_integration.py      — End-to-end integration tests against a real headless
     │                              Ghidra daemon loading tests/fixtures/testapp, covering
     │                              every API domain.  Skipped unless GHIDRA_INSTALL_DIR is
@@ -136,6 +145,12 @@ User Terminal                      Background Process (same machine)
 - **Request**: `{"id": "uuid", "cmd": "decompile", "args": {"binary": "...", "func": "..."}}`
 - **Response**: `{"id": "uuid", "ok": true, "result": {...}}` or `{"id": "uuid", "ok": false, "error": "...", "message": "..."}`
 - **Threading**: each client connection runs in its own thread; a global `_HANDLER_LOCK` in `main.py` serialises all command handler invocations to prevent Ghidra transaction conflicts
+- **CLI-level errors are JSON too**: `cli.main()` calls `cli(standalone_mode=False)` and
+  catches `click.ClickException` (bad options, unknown subcommands, invalid choices,
+  missing required args) so they're reported as `{"ok": false, "error": ..., "message":
+  ...}` on stdout with the same exit code Click would have used, instead of a plain-text
+  usage string. `--help`/`--version` are unaffected (Click handles those via `Exit`,
+  which is caught internally in non-standalone mode and returned as an exit code).
 
 ## Key Design Patterns
 
@@ -206,7 +221,8 @@ uv venv && uv pip install -e .
 
 ### Running Tests (no Ghidra needed)
 ```bash
-python -m pytest tests/test_protocol.py tests/test_client.py tests/test_session_registry.py -v
+python -m pytest tests/test_protocol.py tests/test_client.py tests/test_session_registry.py \
+  tests/test_cli.py tests/test_search_decompiled.py -v
 ```
 
 ### Running Integration Tests (requires Ghidra)
@@ -247,6 +263,11 @@ uv run ghidra-rpc decompile ls main
 6. **Handler serialisation**: All handler invocations are serialised by `_HANDLER_LOCK`.
    Never hold long-running resources across handler boundaries; the lock blocks all
    other commands until the current one completes.
+
+7. **`list-instances`/`stop --all` glob real `/tmp`, not just the registry**: sockets
+   always live in `/tmp` (not covered by `GHIDRA_RPC_STATE_DIR`), so any test touching
+   `_discover_instances()` must also monkeypatch `cli._SOCKET_SCAN_DIR` to a `tmp_path` —
+   otherwise it can see, and `stop --all` can actually kill, real daemons on the host.
 
 > For more detail on all gotchas plus the Ghidra API reference and session/daemon
 > internals, read **`docs/internals.md`**.

@@ -127,6 +127,18 @@ Both are annotation mechanisms. **Tags** attach to functions (classification) wh
 **bookmarks** attach to addresses (location markers). An AI should use tags for
 function-level progress tracking and bookmarks for address-level findings.
 
+### 15. `_discover_instances()` socket glob and test isolation
+`cli._discover_instances()` (backing `list-instances` and `stop --all`) merges the
+session registry with a raw glob over `cli._SOCKET_SCAN_DIR` (default `/tmp`) to catch
+sockets from daemons that predate the registry, or were started manually. Because
+sockets always live in `/tmp` (`session.socket_path_for_project` is not configurable),
+this glob is **not** covered by the `GHIDRA_RPC_STATE_DIR` env var that isolates the
+registry file in tests. Any test that exercises `list-instances`/`stop --all` (or calls
+`_discover_instances()` directly) must also monkeypatch `cli._SOCKET_SCAN_DIR` to a
+`tmp_path`, or it will see — and `stop --all` will actually stop — real daemons running
+on the host. See `tests/test_session_registry.py`'s `isolate_registry` fixtures for the
+pattern.
+
 ## Ghidra API Quick Reference
 
 Full javadoc: `$GHIDRA_INSTALL_DIR/docs/GhidraAPI_javadoc.zip`  
