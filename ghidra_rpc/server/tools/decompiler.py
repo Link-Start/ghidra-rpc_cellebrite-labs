@@ -95,4 +95,116 @@ def _handle_decompile(ctx, args: dict) -> dict:
     }
 
 
+def _handle_search_decompiled(ctx, args: dict) -> dict:
+    """Regex-search the decompiled C of many functions in one RPC call.
+
+    Avoids the "enumerate with `symbols`, `decompile` each, grep the C
+    client-side" pattern (one round-trip per function) for tasks like
+    "which function builds this UUID / calls this callee / touches this
+    struct field".
+
+    Args (in ``args`` dict):
+        binary        -- program name / key
+        pattern       -- regex to search for, applied per source line
+        class_filter  -- optional: only search functions whose fully
+                          qualified name (namespace path, e.g.
+                          "com::example::Foo::bar") contains this substring
+                          (case-insensitive)
+        ignore_case   -- case-insensitive pattern match (default True)
+        limit         -- max matching functions to return (default 50)
+        max_functions -- safety cap on functions actually decompiled
+                          (default 5000); stops the sweep early on very
+                          large programs (e.g. 50k+-function DEX files)
+        timeout       -- per-function decompiler timeout in seconds (default 60)
+
+    Returns a dict with:
+        matches             -- list of {function, address, matching_lines}
+                                where matching_lines is a list of
+                                {line, text}
+        count               -- number of functions with at least one match
+        functions_searched  -- number of functions actually decompiled
+        functions_total     -- number of functions matching class_filter
+                                (before the limit/max_functions cutoff)
+        truncated           -- True if the sweep stopped before covering
+                                every candidate function (limit or
+                                max_functions reached)
+    """
+    import re
+
+    from ghidra.util.task import TaskMonitor
+
+    binary        = args.get("binary", "")
+    pattern_str   = args.get("pattern", "")
+    class_filter  = args.get("class_filter", "")
+    ignore_case   = bool(args.get("ignore_case", True))
+    limit         = int(args.get("limit", 50))
+    max_functions = int(args.get("max_functions", 5000))
+    timeout       = int(args.get("timeout", 60))
+
+    if not binary:
+        raise ValueError("Missing required argument: binary")
+    if not pattern_str:
+        raise ValueError("Missing required argument: pattern")
+
+    try:
+        regex = re.compile(pattern_str, re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        raise ValueError(f"Invalid regex pattern: {e}")
+
+    pi = ctx.get_program(binary)
+    fm = pi.program.getFunctionManager()
+    class_filter_lower = class_filter.lower() if class_filter else None
+
+    candidates = []
+    for func in fm.getFunctions(True):
+        if func.isExternal() or func.isThunk():
+            continue
+        qualified_name = str(func.getSymbol().getName(True))
+        if class_filter_lower and class_filter_lower not in qualified_name.lower():
+            continue
+        candidates.append((func, qualified_name))
+
+    total = len(candidates)
+    matches = []
+    functions_searched = 0
+    truncated = False
+
+    for func, qualified_name in candidates:
+        if functions_searched >= max_functions or len(matches) >= limit:
+            truncated = True
+            break
+        functions_searched += 1
+
+        try:
+            with pi.decompiler_pool.acquire() as decompiler:
+                result = decompiler.decompileFunction(func, timeout, TaskMonitor.DUMMY)
+            decompiled = result.getDecompiledFunction()
+            if decompiled is None:
+                continue
+            c_code = str(decompiled.getC())
+        except Exception:
+            continue
+
+        matching_lines = [
+            {"line": i, "text": line.strip()}
+            for i, line in enumerate(c_code.splitlines(), start=1)
+            if regex.search(line)
+        ]
+        if matching_lines:
+            matches.append({
+                "function": qualified_name,
+                "address": str(func.getEntryPoint()),
+                "matching_lines": matching_lines,
+            })
+
+    return {
+        "matches": matches,
+        "count": len(matches),
+        "functions_searched": functions_searched,
+        "functions_total": total,
+        "truncated": truncated,
+    }
+
+
 register_handler("decompile", _handle_decompile)
+register_handler("search_decompiled", _handle_search_decompiled)

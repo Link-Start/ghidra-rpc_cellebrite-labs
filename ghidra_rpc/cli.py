@@ -1835,9 +1835,12 @@ def match_function(source_binary: str, func: str, target_binary: str,
               help="Max functions to decompile (default: all).")
 @click.option("--offset", "-o", type=int, default=0, show_default=True,
               help="Offset for pagination.")
+@click.option("--socket-timeout", type=float, default=1800.0, show_default=True,
+              help="Max seconds to wait for the whole sweep to finish. Raise "
+                   "this for binaries with many thousands of functions.")
 @click.option("--project", "-p", type=str, help="Path to .gpr project file")
 def decompile_all(binary: str, timeout: int, limit: int | None, offset: int,
-                  project: str | None):
+                  socket_timeout: float, project: str | None):
     """Bulk decompile all functions in a binary.
 
     Returns decompiled pseudo-C for every function (skipping externals
@@ -1849,7 +1852,51 @@ def decompile_all(binary: str, timeout: int, limit: int | None, offset: int,
     args: dict = {"binary": binary, "timeout": timeout, "offset": offset}
     if limit is not None:
         args["limit"] = limit
-    _rpc_command(_resolve_project(project), "decompile_all", args)
+    _rpc_command(_resolve_project(project), "decompile_all", args, socket_timeout=socket_timeout)
+
+
+@cli.command(name="search-decompiled")
+@click.argument("binary")
+@click.argument("pattern")
+@click.option("--class", "class_filter", default="",
+              help="Only search functions whose fully qualified name "
+                   "(namespace path) contains this substring, e.g. a DEX "
+                   "class name.")
+@click.option("--case-sensitive", is_flag=True, default=False,
+              help="Match PATTERN case-sensitively (default: case-insensitive).")
+@click.option("--limit", "-l", type=int, default=50, show_default=True,
+              help="Max matching functions to return.")
+@click.option("--max-scan", type=int, default=5000, show_default=True,
+              help="Safety cap on how many functions are actually decompiled "
+                   "and searched, in case --class isn't given on a huge binary.")
+@click.option("--timeout", "-t", type=int, default=60, show_default=True,
+              help="Per-function decompiler timeout in seconds.")
+@click.option("--socket-timeout", type=float, default=1800.0, show_default=True,
+              help="Max seconds to wait for the whole sweep to finish. Raise "
+                   "this for binaries with many thousands of functions.")
+@click.option("--project", "-p", type=str, help="Path to .gpr project file")
+def search_decompiled(binary: str, pattern: str, class_filter: str, case_sensitive: bool,
+                       limit: int, max_scan: int, timeout: int, socket_timeout: float,
+                       project: str | None):
+    """Regex-search decompiled C across many functions in one call.
+
+    PATTERN is a regex applied per source line of each function's
+    decompiled output.  Use --class to scope the sweep to a namespace (e.g.
+    a DEX/APK class) instead of hand-rolling a symbols+decompile+grep loop
+    per function.
+
+    Note: PATTERN and --class are matched against Ghidra's own decompiled
+    output and qualified names, so results are only as good as Ghidra's
+    analysis (e.g. DEX method/class naming after R8/ProGuard obfuscation).
+    """
+    args: dict = {
+        "binary": binary, "pattern": pattern,
+        "ignore_case": not case_sensitive,
+        "limit": limit, "max_functions": max_scan, "timeout": timeout,
+    }
+    if class_filter:
+        args["class_filter"] = class_filter
+    _rpc_command(_resolve_project(project), "search_decompiled", args, socket_timeout=socket_timeout)
 
 
 @cli.command(name="function-diff")
@@ -2072,12 +2119,19 @@ def set_processor_context(
 
 # \u2500\u2500\u2500 RPC dispatch helper \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-def _rpc_command(gpr: Path, cmd: str, args: dict) -> None:
-    """Send a command to the daemon, with auto-restart on failure."""
+def _rpc_command(gpr: Path, cmd: str, args: dict, socket_timeout: float | None = None) -> None:
+    """Send a command to the daemon, with auto-restart on failure.
+
+    ``socket_timeout``, when given, overrides the client's automatic
+    per-command timeout derivation (see ``client._derive_socket_timeout``).
+    Needed for bulk sweep commands (e.g. decompile-all, search-decompiled)
+    where the wall-clock cost scales with the number of functions in the
+    binary, not with the per-function ``timeout`` argument alone.
+    """
     from ghidra_rpc.client import send_request_with_auto_restart
 
     try:
-        response = send_request_with_auto_restart(gpr, cmd, args)
+        response = send_request_with_auto_restart(gpr, cmd, args, socket_timeout=socket_timeout)
         # Warn on stderr if a write operation returned verified: false so
         # scripted workflows don't silently ignore failed mutations.
         result = response.get("result", {})

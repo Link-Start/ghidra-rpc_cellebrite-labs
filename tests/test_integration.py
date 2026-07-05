@@ -549,6 +549,47 @@ class TestDecompilerAndDisassembly:
                       "address": "0x" + daemon["main_addr"]})["result"]
         assert 0 < len(result["instructions"]) <= 20
 
+    def test_search_decompiled_finds_caller_by_callee_name(self, daemon):
+        """stack_push() calls node_alloc(); searching for that callee name
+        should surface stack_push without decompiling it by name directly."""
+        result = rpc(daemon["sock"], "search_decompiled", {
+            "binary": daemon["short_name"], "pattern": "node_alloc",
+        })["result"]
+        names = [m["function"].lower() for m in result["matches"]]
+        assert any("stack_push" in n for n in names), (
+            f"Expected stack_push among matches: {result['matches']}"
+        )
+        for match in result["matches"]:
+            assert match["matching_lines"], "match with no matching_lines entries"
+            for line in match["matching_lines"]:
+                assert "line" in line and "text" in line
+
+    def test_search_decompiled_is_case_insensitive_by_default(self, daemon):
+        result = rpc(daemon["sock"], "search_decompiled", {
+            "binary": daemon["short_name"], "pattern": "NODE_ALLOC",
+        })["result"]
+        assert result["count"] > 0
+
+    def test_search_decompiled_respects_limit(self, daemon):
+        result = rpc(daemon["sock"], "search_decompiled", {
+            "binary": daemon["short_name"], "pattern": ".",  # matches almost everything
+            "limit": 1,
+        })["result"]
+        assert result["count"] <= 1
+        assert result["truncated"] is True
+
+    def test_search_decompiled_invalid_regex_errors(self, daemon):
+        from ghidra_rpc.client import DaemonError, send_request
+        try:
+            send_request(
+                daemon["sock"], "search_decompiled",
+                {"binary": daemon["short_name"], "pattern": "("},
+                socket_timeout=30,
+            )
+            pytest.fail("Expected DaemonError for invalid regex")
+        except DaemonError as exc:
+            assert exc.error == "ValueError"
+
 
 # ── 5. Memory ─────────────────────────────────────────────────────────────────
 
