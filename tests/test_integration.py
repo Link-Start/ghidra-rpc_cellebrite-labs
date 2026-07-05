@@ -815,6 +815,45 @@ class TestBookmarks:
             "type": "Warning", "category": category,
         })
 
+    def test_list_bookmarks_by_category(self, daemon):
+        uid = uuid.uuid4().hex[:8]
+        addr = "0x" + daemon["main_addr"]
+        category = f"category-filter-test-{uid}"
+
+        rpc(daemon["sock"], "set_bookmark", {
+            "binary": daemon["short_name"], "address": addr,
+            "type": "Note", "category": category, "comment": "category filter test",
+        })
+        # A second, unrelated bookmark that must NOT show up in the filtered results.
+        rpc(daemon["sock"], "set_bookmark", {
+            "binary": daemon["short_name"], "address": addr,
+            "type": "Warning", "category": f"other-{uid}", "comment": "should be excluded",
+        })
+
+        result = rpc(daemon["sock"], "list_bookmarks", {
+            "binary": daemon["short_name"], "category": category,
+        })["result"]
+        categories = [b.get("category") for b in result["bookmarks"]]
+        assert categories == [category], (
+            f"Expected only '{category}', got: {result['bookmarks']}"
+        )
+
+        # Substring match should also work.
+        result = rpc(daemon["sock"], "list_bookmarks", {
+            "binary": daemon["short_name"], "category": "category-filter-test",
+        })["result"]
+        assert category in [b.get("category") for b in result["bookmarks"]]
+
+        # Cleanup
+        rpc(daemon["sock"], "remove_bookmark", {
+            "binary": daemon["short_name"], "address": addr,
+            "type": "Note", "category": category,
+        })
+        rpc(daemon["sock"], "remove_bookmark", {
+            "binary": daemon["short_name"], "address": addr,
+            "type": "Warning", "category": f"other-{uid}",
+        })
+
     def test_remove_bookmark_removes_it(self, daemon):
         uid = uuid.uuid4().hex[:8]
         addr = "0x" + daemon["main_addr"]

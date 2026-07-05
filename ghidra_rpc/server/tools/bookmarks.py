@@ -93,10 +93,15 @@ def _handle_list_bookmarks(ctx, args: dict) -> dict:
     """List bookmarks in a program.
 
     Args (in ``args`` dict):
-        binary  -- program name / key
-        type    -- optional: filter by bookmark type (Note, Warning, etc.)
-        address -- optional: list only bookmarks at this address
-        limit   -- max results (default 200)
+        binary   -- program name / key
+        type     -- optional: filter by bookmark type (Note, Warning, etc.)
+        category -- optional: filter by category (case-insensitive substring
+                    match). Useful for separating user-created bookmarks
+                    (e.g. a custom category like "BLE-Protocol") from
+                    analysis-generated ones (typically category "Address
+                    Table" under type "Analysis").
+        address  -- optional: list only bookmarks at this address
+        limit    -- max results (default 200)
 
     Returns a dict with:
         bookmarks -- list of dicts:
@@ -109,10 +114,12 @@ def _handle_list_bookmarks(ctx, args: dict) -> dict:
     """
     from ghidra_rpc.server.context import _parse_address
 
-    binary      = args.get("binary", "")
-    bm_type     = args.get("type", "")
-    address_str = args.get("address", "")
-    limit       = int(args.get("limit", 200))
+    binary       = args.get("binary", "")
+    bm_type      = args.get("type", "")
+    category_str = args.get("category", "")
+    address_str  = args.get("address", "")
+    limit        = int(args.get("limit", 200))
+    category_lower = category_str.lower() if category_str else None
 
     # Validate type if provided
     if bm_type:
@@ -132,48 +139,33 @@ def _handle_list_bookmarks(ctx, args: dict) -> dict:
 
     def do_list():
         bm_mgr = pi.program.getBookmarkManager()
-        bookmarks = []
-        total = 0
 
         if address_str:
-            # List bookmarks at a specific address
             addr = _parse_address(pi.program, address_str)
-            bms = bm_mgr.getBookmarks(addr)
-            for bm in bms:
-                if bm_type and str(bm.getTypeString()) != bm_type:
-                    continue
-                total += 1
-                if len(bookmarks) < limit:
-                    bookmarks.append({
-                        "address":  str(bm.getAddress()),
-                        "type":     str(bm.getTypeString()),
-                        "category": str(bm.getCategory()),
-                        "comment":  str(bm.getComment()),
-                    })
+            bm_iter = bm_mgr.getBookmarks(addr)
         elif bm_type:
-            # List all bookmarks of a specific type
             bm_iter = bm_mgr.getBookmarksIterator(bm_type)
-            for bm in bm_iter:
-                total += 1
-                if len(bookmarks) < limit:
-                    bookmarks.append({
-                        "address":  str(bm.getAddress()),
-                        "type":     str(bm.getTypeString()),
-                        "category": str(bm.getCategory()),
-                        "comment":  str(bm.getComment()),
-                    })
         else:
-            # List all bookmarks (iterate over all types)
             bm_iter = bm_mgr.getBookmarksIterator()
-            for bm in bm_iter:
-                total += 1
-                if len(bookmarks) < limit:
-                    bookmarks.append({
-                        "address":  str(bm.getAddress()),
-                        "type":     str(bm.getTypeString()),
-                        "category": str(bm.getCategory()),
-                        "comment":  str(bm.getComment()),
-                    })
+
+        bookmarks = []
+        total = 0
+        for bm in bm_iter:
+            # getBookmarks(addr) isn't pre-filtered by type; the other two
+            # iterators already are, so this check is a cheap no-op for them.
+            if bm_type and str(bm.getTypeString()) != bm_type:
+                continue
+            bm_category = str(bm.getCategory())
+            if category_lower is not None and category_lower not in bm_category.lower():
+                continue
+            total += 1
+            if len(bookmarks) < limit:
+                bookmarks.append({
+                    "address":  str(bm.getAddress()),
+                    "type":     str(bm.getTypeString()),
+                    "category": bm_category,
+                    "comment":  str(bm.getComment()),
+                })
 
         return {"bookmarks": bookmarks, "count": len(bookmarks), "total": total}
 

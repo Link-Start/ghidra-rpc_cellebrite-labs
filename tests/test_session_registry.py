@@ -217,6 +217,10 @@ class TestDiscoverInstances:
     @pytest.fixture(autouse=True)
     def isolate_registry(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GHIDRA_RPC_STATE_DIR", str(tmp_path))
+        # _discover_instances() also globs a socket dir for orphaned sockets
+        # not in the registry; redirect it so this never touches /tmp and
+        # can't see (or stop!) real daemons running on the host.
+        monkeypatch.setattr("ghidra_rpc.cli._SOCKET_SCAN_DIR", tmp_path)
 
     def test_empty_when_nothing_registered_or_running(self):
         from ghidra_rpc.cli import _discover_instances
@@ -290,13 +294,14 @@ class TestDiscoverInstances:
         assert load_all() == []
 
     def test_unregistered_socket_discovered_via_glob(self, tmp_path, monkeypatch):
-        """Sockets in /tmp not in the registry are still discovered via glob."""
-        # Create a socket file with the canonical naming pattern in /tmp
+        """Sockets in the scan dir not in the registry are still discovered via glob."""
+        # Create a socket file with the canonical naming pattern in the
+        # (isolated) scan dir -- not real /tmp, per isolate_registry above.
         import hashlib
         gpr = tmp_path / "unregistered.gpr"
         gpr.touch()
         digest = hashlib.sha256(str(gpr.resolve()).encode()).hexdigest()[:8]
-        sock_path = Path("/tmp") / f"ghidra-rpc-{digest}.sock"
+        sock_path = tmp_path / f"ghidra-rpc-{digest}.sock"
 
         sess = Session(mode="headless", project_gpr=gpr, socket_path=sock_path)
         # Deliberately do NOT register — only start the server
@@ -320,6 +325,9 @@ class TestListInstancesCLI:
     @pytest.fixture(autouse=True)
     def isolate_registry(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GHIDRA_RPC_STATE_DIR", str(tmp_path))
+        # `stop --all` walks the same discovery path as _discover_instances;
+        # without this a real daemon on the host could get stopped for real.
+        monkeypatch.setattr("ghidra_rpc.cli._SOCKET_SCAN_DIR", tmp_path)
 
     def test_empty_result(self):
         from click.testing import CliRunner

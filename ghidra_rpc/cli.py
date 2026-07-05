@@ -38,6 +38,13 @@ HEX_INT = HexInt()
 from ghidra_rpc import session as session_mod
 from ghidra_rpc.client import DaemonError, DaemonNotRunning
 
+# Directory scanned by _discover_instances() for orphaned sockets not in the
+# registry. Sockets always live in /tmp (see session.socket_path_for_project),
+# so this is a plain module attribute purely so tests can monkeypatch it to a
+# tmp_path -- without that, a test-invoked `stop --all` would glob-match and
+# stop *real* daemons running on the developer's machine.
+_SOCKET_SCAN_DIR = Path("/tmp")
+
 
 def _resolve_project(project: str | None) -> Path:
     """Resolve the project .gpr path from flag, env var, or error."""
@@ -65,12 +72,13 @@ def _json_error(error: str, message: str) -> None:
 
 
 def _discover_instances(include_dead: bool = False) -> list[dict]:
-    """Discover all ghidra-rpc daemon instances via registry + /tmp glob.
+    """Discover all ghidra-rpc daemon instances via registry + socket-dir glob.
 
     Merges entries from the global session registry with any
-    ``/tmp/ghidra-rpc-*.sock`` files not already in the registry (catches
-    pre-registry installs and manually started daemons).  Each candidate is
-    probed with a short-timeout ping so liveness is always authoritative.
+    ``ghidra-rpc-*.sock`` files under ``_SOCKET_SCAN_DIR`` not already in the
+    registry (catches pre-registry installs and manually started daemons).
+    Each candidate is probed with a short-timeout ping so liveness is always
+    authoritative.
 
     When *include_dead* is False (default) only live instances are returned.
     Registry entries whose socket file has disappeared are pruned automatically.
@@ -88,12 +96,12 @@ def _discover_instances(include_dead: bool = False) -> list[dict]:
         return None
 
     # Registry entries take precedence (they carry ghidra_install_dir etc.);
-    # the /tmp glob catches anything not registered.
+    # the socket-dir glob catches anything not registered.
     candidates: dict[str, dict] = {}  # str(socket_path) -> {socket, session}
     for sess in session_mod.load_all():
         key = str(sess.socket_path)
         candidates[key] = {"socket": sess.socket_path, "session": sess}
-    for sock_path in sorted(Path("/tmp").glob("ghidra-rpc-*.sock")):
+    for sock_path in sorted(_SOCKET_SCAN_DIR.glob("ghidra-rpc-*.sock")):
         key = str(sock_path)
         if key not in candidates:
             candidates[key] = {"socket": sock_path, "session": None}
@@ -678,7 +686,7 @@ def rename_symbol(binary: str, address: str, new_name: str, create: bool,
 @cli.command(name="set-comment")
 @click.argument("binary")
 @click.argument("address")
-@click.argument("comment")
+@click.option("--comment", required=True, help="Comment text.")
 @click.option("--type", "comment_type", type=click.Choice(["plate", "pre", "post", "eol", "repeatable"]), default="eol")
 @click.option("--project", "-p", type=str, help="Path to .gpr project file")
 def set_comment(binary: str, address: str, comment: str, comment_type: str, project: str | None):
@@ -1342,20 +1350,26 @@ def set_bookmark(binary: str, address: str, bm_type: str, category: str,
 @click.argument("binary")
 @click.option("--type", "bm_type", default="",
               help="Filter by bookmark type (Note, Warning, Error, Info, Analysis).")
+@click.option("--category", "category", default="",
+              help="Filter by bookmark category (substring match, case-insensitive).")
 @click.option("--address", "-a", default="",
               help="List only bookmarks at this address.")
 @click.option("--limit", "-l", type=int, default=200, help="Max results")
 @click.option("--project", "-p", type=str, help="Path to .gpr project file")
-def list_bookmarks(binary: str, bm_type: str, address: str, limit: int,
+def list_bookmarks(binary: str, bm_type: str, category: str, address: str, limit: int,
                   project: str | None):
     """List bookmarks in a program.
 
-    Without filters, lists all bookmarks.  Use --type to filter by
-    bookmark type, or --address to list bookmarks at a specific address.
+    Without filters, lists all bookmarks.  Use --type to filter by bookmark
+    type, --category to filter by category (e.g. to exclude/isolate
+    analysis-generated bookmarks from user-created ones), or --address to
+    list bookmarks at a specific address.
     """
     args: dict = {"binary": binary, "limit": limit}
     if bm_type:
         args["type"] = bm_type
+    if category:
+        args["category"] = category
     if address:
         args["address"] = address
     _rpc_command(_resolve_project(project), "list_bookmarks", args)
@@ -2084,7 +2098,24 @@ def _rpc_command(gpr: Path, cmd: str, args: dict) -> None:
 
 
 def main():
-    cli()
+    """Entry point. Converts Click usage errors (bad options/args, unknown
+    subcommands, etc.) to the same JSON error envelope as RPC failures, so
+    scripted callers never have to handle a plain-text usage message.
+    """
+    try:
+        rv = cli(standalone_mode=False)
+    except click.ClickException as e:
+        click.echo(json.dumps({
+            "ok": False,
+            "error": type(e).__name__,
+            "message": e.format_message(),
+        }))
+        sys.exit(e.exit_code)
+    except click.exceptions.Abort:
+        click.echo("Aborted!", err=True)
+        sys.exit(1)
+    else:
+        sys.exit(rv if isinstance(rv, int) else 0)
 
 
 if __name__ == "__main__":
