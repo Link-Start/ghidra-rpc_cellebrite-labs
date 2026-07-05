@@ -122,6 +122,11 @@ when `--class` isn't given, so a search on a 50k+-function binary can't run away
 | `ghidra-rpc strings <binary> <query> [--limit N]` | Search strings (substring) | `{strings: [{address, value, type}], count}` |
 | `ghidra-rpc symbols <binary> <query> [--limit N] [--offset N]` | Search symbols | `{symbols: [{name, address, type}], count, total}` |
 
+`symbols` normalizes literal spaces and underscores as equivalent before matching, so a
+query pasted straight from `strings` output (real spaces) still finds the corresponding
+label even though Ghidra auto-generates labels from string content by turning each space
+into `_` (and leaving every other character, including non-ASCII/CJK text, untouched).
+
 ### Cross-References
 
 | Command | Description | Output shape |

@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+import re
+
 from ghidra_rpc.server.main import register_handler
+
+_SPACE_UNDERSCORE_RE = re.compile(r"[ _]+")
+
+
+def _normalize_symbol_query(s: str) -> str:
+    """Collapse spaces/underscores to a single canonical form for matching.
+
+    Ghidra's ``SymbolUtilities.replaceInvalidChars`` replaces literal ASCII
+    spaces with underscores (and only spaces -- no other character, including
+    non-ASCII text) when it auto-generates a label from string content (e.g.
+    DEX ``strings::``/``string_data::`` labels). A query copied verbatim from
+    ``strings`` output therefore has spaces where the label has underscores
+    and would never match under a plain substring search.
+    """
+    return _SPACE_UNDERSCORE_RE.sub("_", s.lower())
 
 
 def _normalize_byte_pattern(pattern: str) -> str:
@@ -202,12 +219,14 @@ def _handle_search_symbols(ctx, args: dict) -> dict:
     pi = ctx.get_program(binary)
     st = pi.program.getSymbolTable()
     query_lower = query.lower()
+    query_norm = _normalize_symbol_query(query)
 
     results = []
     for sym in st.getAllSymbols(False):
         name = str(sym.getName())
         full_name = str(sym.getName(True))
-        if query_lower in name.lower() or query_lower in full_name.lower():
+        if (query_norm in _normalize_symbol_query(name)
+                or query_norm in _normalize_symbol_query(full_name)):
             results.append({
                 "name": full_name,
                 "address": str(sym.getAddress()),

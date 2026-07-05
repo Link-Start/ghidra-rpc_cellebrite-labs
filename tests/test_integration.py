@@ -1001,6 +1001,40 @@ class TestCommentsAndLabels:
                 "name":    orig_name,
             })
 
+    def test_symbols_search_matches_space_for_underscore(self, daemon):
+        """Ghidra's SymbolUtilities replaces literal spaces (and only spaces --
+        not other punctuation, not non-ASCII text) with underscores when it
+        auto-generates a label from string content, e.g. DEX ``strings::``/
+        ``string_data::`` labels. A query copied verbatim from `strings`
+        output -- with real spaces -- must still match such labels."""
+        uid  = uuid.uuid4().hex[:8]
+        addr = "0x" + daemon["main_addr"]
+        name = f"space_norm_{uid}_two_words"
+
+        result = rpc(daemon["sock"], "create_label", {
+            "binary":  daemon["short_name"],
+            "address": addr,
+            "name":    name,
+        })["result"]
+
+        sym_result = rpc(daemon["sock"], "symbols",
+                         {"binary": daemon["short_name"],
+                          "query": f"space norm {uid} two words", "limit": 5})["result"]
+        sym_names = [s["name"] for s in sym_result["symbols"]]
+        assert name in sym_names, (
+            f"Query with spaces should match underscore-containing label "
+            f"'{name}'; got: {sym_names}"
+        )
+
+        # Cleanup: restore the original name
+        orig_name = result.get("old_name") or daemon["main_name"]
+        if orig_name:
+            rpc(daemon["sock"], "create_label", {
+                "binary":  daemon["short_name"],
+                "address": addr,
+                "name":    orig_name,
+            })
+
 
 # ── 10. Function rename ───────────────────────────────────────────────────────
 

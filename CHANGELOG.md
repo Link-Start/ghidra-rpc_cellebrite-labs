@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- `symbols` missed labels containing spaces (including CJK/multi-word strings
+  with a space anywhere in them), because Ghidra's `SymbolUtilities` replaces
+  literal ASCII spaces — and only spaces, no other character, ASCII or not —
+  with `_` when it auto-generates a label from string content (e.g. DEX
+  `strings::`/`string_data::` labels). A query pasted verbatim from `strings`
+  output therefore had spaces where the label had underscores and never
+  matched. `symbols` now normalizes spaces/underscores as equivalent before
+  comparing. Confirmed against a real multidex APK project and reproduced at
+  the Ghidra bytecode level (`SymbolUtilities.INVALIDCHARS` is `{' '}`) before
+  fixing.
 - CLI usage errors (unknown options, invalid `--type`/`--mode` choices, unknown
   subcommands, missing required arguments) previously printed a plain-text Click
   usage string, breaking the documented "all output is JSON" contract for scripted
