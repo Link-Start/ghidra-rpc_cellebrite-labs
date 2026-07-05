@@ -48,25 +48,18 @@ def _resolve_address(pi, target: str):
     raise ValueError(f"Cannot resolve target '{target}' to an address.")
 
 
-def _handle_xrefs_to(ctx, args: dict) -> dict:
-    """Find cross-references TO a target (who calls/references this?)."""
-    binary = args.get("binary", "")
-    target = args.get("target", "")
-    limit = args.get("limit", 50)
+def _collect_xrefs_at(pi, addr, limit: int) -> list[dict]:
+    """Collect real references to ``addr`` within a single program.
 
-    if not target:
-        raise ValueError("Missing required argument: target")
-
-    pi = ctx.get_program(binary)
-    addr = _resolve_address(pi, target)
+    When ``addr`` falls in the EXTERNAL address space (e.g. an imported
+    function's EXTERNAL symbol), callers don't reference that synthetic
+    address directly — they call through thunk/PLT stubs — so this also walks
+    every thunk function whose immediate target is ``addr`` and includes its
+    callers too.
+    """
     rm = pi.program.getReferenceManager()
     fm = pi.program.getFunctionManager()
 
-    # When the resolved address falls in the EXTERNAL address space (e.g. the user
-    # passed the import's EXTERNAL symbol address directly), callers don't reference
-    # that synthetic address — they call through thunk/PLT stubs.  Collect xrefs to
-    # all thunk functions whose immediate thunk target is this external address so that
-    # callers of the import are included in the results.
     addrs_to_check = [addr]
     if addr.getAddressSpace().isExternalSpace():
         for func in fm.getFunctions(True):
@@ -91,6 +84,76 @@ def _handle_xrefs_to(ctx, args: dict) -> dict:
             })
         if len(xrefs) >= limit:
             break
+    return xrefs
+
+
+def _program_key(ctx, pi) -> str:
+    """Look up the ``ctx.programs`` key for an already-resolved ProgramInfo."""
+    with ctx._programs_lock:
+        for key, candidate in ctx.programs.items():
+            if candidate is pi:
+                return key
+    return pi.name
+
+
+def _handle_xrefs_to(ctx, args: dict) -> dict:
+    """Find cross-references TO a target (who calls/references this?).
+
+    With ``all_binaries``, also searches every other currently loaded program
+    for a symbol with the same fully-qualified name and merges in real
+    callers found there (each entry then carries a ``binary`` field). This is
+    necessary because Ghidra's ReferenceManager is per-Program: a call whose
+    caller and target live in two different loaded binaries is invisible to
+    a single-program getReferencesTo() lookup. Most commonly hit on multidex
+    Android projects (a method called from a different classesN.dex than the
+    one that defines it), but the limitation isn't DEX-specific — it applies
+    to any project with more than one binary loaded in the daemon.
+    """
+    binary = args.get("binary", "")
+    target = args.get("target", "")
+    limit = args.get("limit", 50)
+    all_binaries = bool(args.get("all_binaries", False))
+
+    if not target:
+        raise ValueError("Missing required argument: target")
+
+    pi = ctx.get_program(binary)
+    addr = _resolve_address(pi, target)
+    xrefs = _collect_xrefs_at(pi, addr, limit)
+
+    if not all_binaries:
+        return {"xrefs": xrefs, "count": len(xrefs)}
+
+    # Tag same-binary results so the shape is uniform once other binaries are mixed in.
+    own_key = _program_key(ctx, pi)
+    for x in xrefs:
+        x["binary"] = own_key
+
+    sym = pi.program.getSymbolTable().getPrimarySymbol(addr)
+    if sym is None or len(xrefs) >= limit:
+        return {"xrefs": xrefs, "count": len(xrefs)}
+
+    qualified_name = str(sym.getName(True))
+    leaf_name = str(sym.getName())
+
+    with ctx._programs_lock:
+        other_programs = [(key, p) for key, p in ctx.programs.items() if p is not pi]
+
+    for other_key, other_pi in other_programs:
+        if len(xrefs) >= limit:
+            break
+        try:
+            candidates = list(other_pi.program.getSymbolTable().getSymbols(leaf_name))
+        except Exception:
+            continue
+        for cand in candidates:
+            if str(cand.getName(True)) != qualified_name:
+                continue
+            for x in _collect_xrefs_at(other_pi, cand.getAddress(), limit - len(xrefs)):
+                x["binary"] = other_key
+                xrefs.append(x)
+            if len(xrefs) >= limit:
+                break
 
     return {"xrefs": xrefs, "count": len(xrefs)}
 

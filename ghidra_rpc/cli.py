@@ -567,11 +567,16 @@ def search_symbols(binary: str, query: str, limit: int, offset: int, project: st
 @click.argument("binary")
 @click.argument("target")
 @click.option("--limit", "-l", type=int, default=50, help="Max results")
+@click.option("--all-binaries", "all_binaries", is_flag=True, default=False,
+              help="Also search every other loaded binary for a same-named symbol "
+                   "(e.g. a method defined here but called from a different dex) "
+                   "and merge in real callers found there. Each result then "
+                   "carries a 'binary' field.")
 @click.option("--project", "-p", type=str, help="Path to .gpr project file")
-def xrefs_to(binary: str, target: str, limit: int, project: str | None):
+def xrefs_to(binary: str, target: str, limit: int, all_binaries: bool, project: str | None):
     """Find cross-references TO a target."""
     _rpc_command(_resolve_project(project), "xrefs_to", {
-        "binary": binary, "target": target, "limit": limit,
+        "binary": binary, "target": target, "limit": limit, "all_binaries": all_binaries,
     })
 
 

@@ -715,6 +715,39 @@ class TestXrefs:
         assert "xrefs" in result
         assert "count" in result
 
+    def test_xrefs_to_all_binaries_merges_second_program(self, daemon, tmp_path):
+        """--all-binaries should find and tag real callers in every other loaded
+        binary that has a symbol with the same fully-qualified name -- the
+        general form of the DEX cross-dex-call gap (Ghidra's ReferenceManager
+        is per-Program, so a caller in a different loaded binary is otherwise
+        invisible to xrefs_to). Uses a second copy of testapp -- under a name
+        that can't substring-collide with 'testapp' in later get_program()
+        lookups -- as a stand-in for "another loaded binary with a matching
+        symbol", since that's all the merge logic actually depends on.
+        """
+        import shutil
+
+        copy_path = tmp_path / "xrefs_probe_binary"
+        shutil.copy(_TEST_BINARY, copy_path)
+
+        load_result = rpc(daemon["sock"], "load", {"path": str(copy_path)},
+                          timeout=_LOAD_TIMEOUT)["result"]
+        copy_key = load_result["binary"]
+        assert copy_key != daemon["binary"]
+
+        result = rpc(daemon["sock"], "xrefs_to",
+                     {"binary": daemon["short_name"], "target": daemon["main_name"],
+                      "limit": 50, "all_binaries": True})["result"]
+
+        binaries_seen = {x["binary"] for x in result["xrefs"]}
+        assert daemon["binary"] in binaries_seen, (
+            f"Expected own-binary xrefs tagged with '{daemon['binary']}'; got: {binaries_seen}"
+        )
+        assert copy_key in binaries_seen, (
+            f"Expected the identical second binary '{copy_key}' to be searched "
+            f"and its real callers merged in; got: {binaries_seen}"
+        )
+
 
 # ── 7. Control-flow graph ─────────────────────────────────────────────────────
 
