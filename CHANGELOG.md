@@ -51,12 +51,15 @@
   bookmarks from Ghidra's auto-generated `Analysis`-type ones (commonly category
   `Address Table`), which can otherwise number in the hundreds on large/heavily
   analyzed programs and bury a handful of user bookmarks in the default listing.
-- Documented that DEX method `xrefs-to` correctly resolves callers within the
-  same DEX program, but only sees table/`EXTERNAL` references — not real
-  callers — when every caller lives in a *different* DEX program (the common
-  multidex case). This is a general multi-binary limitation (each loaded
-  binary is an independent Ghidra `Program`), not a Dalvik-analyzer gap; the
-  same limitation previously documented only for strings/class descriptors —
+- `xrefs-to --all-binaries`: also search every other currently loaded binary
+  for a symbol with the same fully-qualified name and merge in real callers
+  found there (each merged entry carries a `binary` field). Fixes the common
+  multidex case where a method's only callers live in a *different* loaded
+  `classesN.dex` — Ghidra's `ReferenceManager`/`SymbolTable` are per-`Program`,
+  so a single-binary `xrefs-to` can't see a reference whose source and target
+  live in two different loaded programs; this isn't a Dalvik-analyzer gap,
+  and isn't DEX-specific — the same limitation applies to any ghidra-rpc
+  project with more than one binary loaded. Documented in
   `docs/flows/android-apk.md`.
 
 - Android APK / DEX analysis guidance: new `docs/flows/android-apk.md` flow and a

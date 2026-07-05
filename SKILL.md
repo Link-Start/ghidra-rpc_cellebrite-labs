@@ -110,7 +110,8 @@ is ambiguous, the error message lists matches so you can use the address instead
 `search-decompiled` is especially useful on multidex Android projects, where `xrefs-to`
 on a method only sees callers within the same DEX program (see the Android APK/DEX
 section) — use it in place of a symbols+decompile+grep loop, e.g. `search-decompiled
-app.apk targetF1 --class com::example::Foo`. `--max-scan` (default 5000) bounds how many functions get decompiled
+app.apk targetF1 --class
+com::example::Foo`. `--max-scan` (default 5000) bounds how many functions get decompiled
 when `--class` isn't given, so a search on a 50k+-function binary can't run away; raise
 `--socket-timeout` (default 1800s) alongside it if you do widen the scan.
 
@@ -131,8 +132,17 @@ into `_` (and leaving every other character, including non-ASCII/CJK text, untou
 
 | Command | Description | Output shape |
 |---------|-------------|--------------|
-| `ghidra-rpc xrefs-to <binary> <target> [--limit N]` | Who references this? | `{xrefs: [{from_address, from_function, type}], count}` |
+| `ghidra-rpc xrefs-to <binary> <target> [--limit N] [--all-binaries]` | Who references this? | `{xrefs: [{from_address, from_function, type}], count}` |
 | `ghidra-rpc xrefs-from <binary> <target> [--limit N] [--no-stack]` | What does this reference? (`--no-stack` hides `Stack[-0x...]` entries) | `{xrefs: [{to_address, to_function, type}], count}` |
+
+Ghidra's reference manager is per-binary: a call whose caller and target live in two
+*different* loaded binaries is invisible to a single-binary `xrefs-to` lookup (most
+commonly hit on multidex Android projects, where a method in one `classesN.dex` is
+called from another, but this isn't DEX-specific — it applies to any project with more
+than one binary loaded in the daemon). Pass `--all-binaries` to also search every other
+currently loaded binary for a symbol with the same fully-qualified name and merge in
+real callers found there; each merged entry carries a `binary` field so you can tell
+which binary it came from.
 
 ### Navigation (GUI mode only)
 

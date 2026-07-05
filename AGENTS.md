@@ -60,7 +60,11 @@ ghidra-rpc/
 │           │                     search_decompiled (regex-search decompiled C across
 │           │                     many functions in one call; optional class_filter)
 │           ├── search.py       — strings, symbols, find_bytes (byte pattern search)
-│           ├── xrefs.py        — xrefs_to, xrefs_from
+│           ├── xrefs.py        — xrefs_to (optional all_binaries: also searches every
+│           │                     other loaded program for a matching fully-qualified
+│           │                     symbol name and merges in real callers, tagged with
+│           │                     a "binary" field — see _collect_xrefs_at/_program_key),
+│           │                     xrefs_from
 │           ├── navigation.py   — goto (GUI-only)
 │           ├── bookmarks.py    — set_bookmark, list_bookmarks (type/category/address
 │           │                     filters), remove_bookmark
@@ -268,6 +272,18 @@ uv run ghidra-rpc decompile ls main
    always live in `/tmp` (not covered by `GHIDRA_RPC_STATE_DIR`), so any test touching
    `_discover_instances()` must also monkeypatch `cli._SOCKET_SCAN_DIR` to a `tmp_path` —
    otherwise it can see, and `stop --all` can actually kill, real daemons on the host.
+
+8. **`ReferenceManager`/`SymbolTable` are per-`Program`, not per-project**: two loaded
+   binaries never share reference/symbol data, even byte-identical ones. A reference
+   whose source and target live in two different loaded programs is invisible to any
+   single-program lookup — there is no cross-program equivalent to call. When a feature
+   needs to look something up across every loaded binary (e.g. `xrefs_to`'s
+   `all_binaries` option), iterate `ctx.programs` yourself and match by fully-qualified
+   symbol name (`Symbol.getName(True)`) via `SymbolTable.getSymbols(leafName)` (indexed
+   by leaf name, then filter on the full qualified name) — don't assume Ghidra resolves
+   this for you. First hit on DEX (`invoke-*` to a method in another `classesN.dex`
+   resolves only to a local placeholder symbol, not the real function), but it's a
+   general multi-binary limitation, not Dalvik-specific.
 
 > For more detail on all gotchas plus the Ghidra API reference and session/daemon
 > internals, read **`docs/internals.md`**.

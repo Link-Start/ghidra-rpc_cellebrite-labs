@@ -128,12 +128,21 @@ a reference whose source and target live in two different programs. A caller
 in another dex calls through its *own* local placeholder symbol for the
 method (visible in that dex's own `symbols`/decompiled output, not the
 target dex's), so `xrefs-to <method>` on the defining dex alone will miss it.
-There is currently no cross-binary-aware `xrefs-to` in ghidra-rpc.
 
-To find real callers/usage sites in a DEX program, use `search-decompiled` to
-regex-search decompiled method bodies for the callee/class/field name across
-many functions in one call (optionally scoped with `--class`), instead of
-hand-rolling a `symbols` + `decompile` + grep loop per method:
+Pass `--all-binaries` to have `xrefs-to` search every other currently loaded
+dex for a symbol with the same fully-qualified name and merge in real callers
+found there — the other dex(es) must already be `load`ed for this to see them:
+
+```bash
+ghidra-rpc load app-classes3.dex
+ghidra-rpc load app-classes5.dex   # must be loaded for --all-binaries to see its callers
+ghidra-rpc xrefs-to app-classes3.dex 0x501e4ab8 --all-binaries   # or an unambiguous bare function name
+```
+
+`search-decompiled` remains useful as a complementary regex-search tool — e.g. to find
+usage sites by pattern rather than exact symbol name, or to confirm a `--all-binaries`
+placeholder match isn't a name collision between two unrelated classes that happen to
+share a short obfuscated name (common in heavily obfuscated multidex apps):
 
 ```bash
 ghidra-rpc search-decompiled app.apk "targetF1" --class com::example::Foo
