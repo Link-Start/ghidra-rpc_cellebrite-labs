@@ -32,7 +32,7 @@ uv pip install -e /path/to/ghidra-rpc
 
 ```bash
 ghidra-rpc --version
-# Should print: ghidra-rpc, version 0.1.0
+# Should print: ghidra-rpc, version 0.2.0
 ```
 
 ## What Gets Installed

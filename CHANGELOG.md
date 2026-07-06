@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-06
+
 ### Fixed
 
 - `symbols` missed labels containing spaces (including CJK/multi-word strings
