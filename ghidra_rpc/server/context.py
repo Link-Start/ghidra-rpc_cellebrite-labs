@@ -181,6 +181,7 @@ class HeadlessContext:
         self.session = session
         self.programs: dict[str, ProgramInfo] = {}
         self._programs_lock = threading.RLock()
+        self._consumer = "ghidra-rpc"  # our own Program consumer token
 
         gpr = session.project_gpr
         project_dir = gpr.parent
@@ -198,6 +199,25 @@ class HeadlessContext:
             )
 
         logger.info(f"Opened headless project: {project_name}")
+
+    def _take_ownership(self, program) -> None:
+        """Release GhidraProject's permanently-open outer transaction on *program*.
+
+        GhidraProject keeps every opened/imported program under one long-lived
+        transaction until GhidraProject.save() settles it, so our own
+        ghidra_transaction() calls nest inside it -- an aborted nested
+        transaction then rolls back the whole intertwined group on the next
+        flush (confirmed as intended Ghidra behavior, not a bug; see
+        https://github.com/NationalSecurityAgency/ghidra/issues/9347).
+        Becoming our own consumer and releasing the project's makes our
+        transactions top-level instead.
+
+        Must be called AFTER initial auto-analysis and its save() -- releasing
+        ownership earlier silently breaks analyzeAll() (no functions get
+        created despite it reporting success).
+        """
+        program.addConsumer(self._consumer)
+        self.project.close(program)
 
     def load_binary(self, binary_path: str, *,
                     analyze: bool = True,
@@ -277,6 +297,8 @@ class HeadlessContext:
                         GhidraProgramUtilities.markProgramAnalyzed(program)
                 self.project.save(program)
 
+            self._take_ownership(program)
+
             pi = ProgramInfo(
                 name=program_name,
                 program=program,
@@ -318,6 +340,7 @@ class HeadlessContext:
                     GhidraProgramUtilities.markProgramAnalyzed(program)
 
         self.project.save(program)
+        self._take_ownership(program)
 
         key = f"/{program_name}"
         pi = ProgramInfo(
@@ -384,7 +407,8 @@ class HeadlessContext:
                         pi.name, exc_info=True,
                     )
                 pi.decompiler_pool.dispose()
-                self.project.close(pi.program)
+                # project released its consumer in _take_ownership; we're the sole one left
+                pi.program.release(self._consumer)
             self.programs.clear()
         self.project.close()
 

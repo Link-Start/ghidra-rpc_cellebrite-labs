@@ -88,6 +88,7 @@ def _restore_daemon_programs(ctx, src_name, dst_name, src_key, dst_key):
             continue
         try:
             program = ctx.project.openProgram("/", name, False)
+            ctx._take_ownership(program)
             flat_api = FlatProgramAPI(program)
             pi = ProgramInfo(
                 name=name,

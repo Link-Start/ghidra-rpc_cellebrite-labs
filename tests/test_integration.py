@@ -43,6 +43,7 @@ a C compiler on the test machine.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -178,6 +179,83 @@ def rpc(sock: Path, cmd: str, args: dict | None = None,
         pytest.fail(
             f"RPC command '{cmd}' failed with error '{exc.error}': {exc}"
         )
+
+
+# ── Daemon restart / reopen-from-saved-project branch ─────────────────────────
+
+def test_reopen_from_saved_project_survives_abort_then_write(tmp_path):
+    """Covers the 'existing_df' reopen branch in HeadlessContext.load_binary,
+    which _take_ownership must also handle correctly. Not exercised by the
+    shared ``daemon`` fixture, so this starts its own daemon and restarts it
+    on the same project.
+    """
+    import shutil
+
+    from ghidra_rpc.client import DaemonError, send_request
+    from ghidra_rpc.daemon import start_background, stop_daemon
+    from ghidra_rpc.session import Session, socket_path_for_project
+
+    gpr = tmp_path / "reopen_test_project.gpr"
+    sock = socket_path_for_project(gpr)
+    session = Session(
+        mode="headless", project_gpr=gpr, socket_path=sock,
+        ghidra_install_dir=Path(GHIDRA_DIR),
+    )
+    binary_path = tmp_path / "testapp"
+    shutil.copy(_TEST_BINARY, binary_path)
+
+    start_background(session, timeout=_DAEMON_START_TIMEOUT)
+    try:
+        first = send_request(sock, "load", {"path": str(binary_path), "analyze": True},
+                              socket_timeout=_LOAD_TIMEOUT)
+        assert first["ok"] is True, first
+        short_name = first["result"]["short_name"]
+    finally:
+        stop_daemon(sock)
+
+    # stop_daemon() returns on the "stopping" ack, but the old daemon's socket
+    # can stay bound for ~1s afterward -- wait for it to vanish before starting
+    # a new one on the same project.
+    deadline = time.time() + 10
+    while sock.exists() and time.time() < deadline:
+        time.sleep(0.2)
+
+    start_background(session, timeout=_DAEMON_START_TIMEOUT)
+    try:
+        # Same .gpr, same path -> hits the existing_df/already_analyzed=True
+        # reopen branch, not the fresh-import branch.
+        reopened = send_request(sock, "load", {"path": str(binary_path), "analyze": True},
+                                 socket_timeout=_LOAD_TIMEOUT)
+        assert reopened["ok"] is True, reopened
+        assert reopened["result"]["short_name"] == short_name
+
+        try:
+            send_request(sock, "create_struct", {
+                "binary": short_name, "name": "ReopenAbortStruct",
+                "fields": [
+                    {"type": "int", "name": "ok_field"},
+                    {"type": "string", "name": "bad_dynamic_field"},
+                ],
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected create_struct to fail on a dynamic-length field")
+        except DaemonError:
+            pass
+
+        good = send_request(sock, "create_enum", {
+            "binary": short_name, "name": "ReopenAbortEnum",
+            "values": [{"name": "X", "value": 1}],
+        }, socket_timeout=_RPC_TIMEOUT)
+        assert good["ok"] is True, good
+
+        check = send_request(sock, "list_data_types", {
+            "binary": short_name, "query": "ReopenAbortEnum",
+        }, socket_timeout=_RPC_TIMEOUT)
+        assert check["result"]["count"] == 1, (
+            "the write immediately following a failed write, on a REOPENED "
+            f"program, was silently lost: {check['result']}"
+        )
+    finally:
+        stop_daemon(sock)
 
 
 # ── 1. Daemon connectivity ────────────────────────────────────────────────────
@@ -1334,6 +1412,53 @@ class TestDataTypes:
         assert val_map.get("FIRST")  == 10
         assert val_map.get("SECOND") == 20
 
+    def test_failed_write_does_not_wedge_next_write(self, daemon):
+        """A write that aborts mid-transaction must not corrupt the next write.
+
+        See https://github.com/NationalSecurityAgency/ghidra/issues/9347 --
+        GhidraProject kept a permanently-open outer transaction on every
+        managed program, so an aborted nested transaction rolled back the
+        whole intertwined group on the next save(), silently discarding a
+        later, unrelated write.
+        """
+        uid = uuid.uuid4().hex[:8]
+
+        # Trigger a real abort: a dynamic-length field placed after a valid
+        # one makes create_struct mutate the DTM before raising ValueError.
+        from ghidra_rpc.client import DaemonError, send_request
+        try:
+            send_request(daemon["sock"], "create_struct", {
+                "binary": daemon["short_name"],
+                "name": f"AbortWedgeRegressionStruct_{uid}",
+                "fields": [
+                    {"type": "int", "name": "ok_field"},
+                    {"type": "string", "name": "bad_dynamic_field"},
+                ],
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected create_struct to fail on a dynamic-length field")
+        except DaemonError:
+            pass
+
+        # 2. Immediately (no other commands in between) issue a real, valid write.
+        enum_name = f"AbortWedgeRegressionEnum_{uid}"
+        good = rpc(daemon["sock"], "create_enum", {
+            "binary": daemon["short_name"],
+            "name": enum_name,
+            "values": [{"name": "X", "value": 1}],
+        })
+        assert good["ok"] is True
+
+        # 3. Verify via an INDEPENDENT read (not the write's own response) that
+        #    it actually persisted -- this is the crux of the bug: the write's
+        #    own response looks fine either way.
+        check = rpc(daemon["sock"], "list_data_types", {
+            "binary": daemon["short_name"], "query": enum_name,
+        })["result"]
+        assert check["count"] == 1, (
+            "the write immediately following a failed write was silently "
+            f"lost: {check}"
+        )
+
 
 # ── 12. Function tags ─────────────────────────────────────────────────────────
 
@@ -2236,6 +2361,74 @@ class TestListVtable:
             pytest.fail("Expected DaemonError for unresolvable target")
         except DaemonError as exc:
             assert exc.error in ("ValueError", "RuntimeError", "Exception"), exc
+
+
+# ── Version Tracking ───────────────────────────────────────────────────────────
+
+class TestVersionTracking:
+    """version_track, and that _restore_daemon_programs re-applies
+    HeadlessContext._take_ownership after handing the program back."""
+
+    def test_version_track_and_restore(self, daemon, tmp_path):
+        """version_track succeeds and the source binary's handle stays usable
+        afterward, including surviving an abort immediately followed by a
+        real write."""
+        import shutil
+        from ghidra_rpc.client import DaemonError, send_request
+
+        copy_path = tmp_path / "vt_probe_binary"
+        shutil.copy(_TEST_BINARY, copy_path)
+        load_result = rpc(daemon["sock"], "load", {"path": str(copy_path)},
+                          timeout=_LOAD_TIMEOUT)["result"]
+        other_short_name = load_result["short_name"]
+
+        vt_result = rpc(daemon["sock"], "version_track", {
+            "source": daemon["short_name"], "destination": other_short_name,
+            "limit": 5,
+        }, timeout=_LOAD_TIMEOUT)
+        assert vt_result["ok"] is True, vt_result
+        # The two binaries are byte-identical copies of testapp -- nearly every
+        # function should match. A non-zero match count (not just ok=True)
+        # proves VT actually got writable access to real program data, not a
+        # degraded/no-op correlator run against a handle it couldn't use.
+        matched = vt_result["result"]["summary"]["source_functions_matched"]
+        assert matched > 0, (
+            f"expected matches between identical binaries, got 0: {vt_result['result']}"
+        )
+
+        # The daemon's handle to the source binary must still work post-restore.
+        fns = rpc(daemon["sock"], "functions", {"binary": daemon["short_name"]})["result"]
+        assert fns["functions"], "source binary unusable after version_track restore"
+
+        # And its ownership must have been correctly re-taken: an abort
+        # immediately followed by a real write must not wedge the latter.
+        uid = uuid.uuid4().hex[:8]
+        try:
+            send_request(daemon["sock"], "create_struct", {
+                "binary": daemon["short_name"],
+                "name": f"VTPostAbortStruct_{uid}",
+                "fields": [
+                    {"type": "int", "name": "ok_field"},
+                    {"type": "string", "name": "bad_dynamic_field"},
+                ],
+            }, socket_timeout=_RPC_TIMEOUT)
+            pytest.fail("Expected create_struct to fail on a dynamic-length field")
+        except DaemonError:
+            pass
+
+        enum_name = f"VTPostAbortEnum_{uid}"
+        good = rpc(daemon["sock"], "create_enum", {
+            "binary": daemon["short_name"], "name": enum_name,
+            "values": [{"name": "X", "value": 1}],
+        })
+        assert good["ok"] is True
+
+        check = rpc(daemon["sock"], "list_data_types", {
+            "binary": daemon["short_name"], "query": enum_name,
+        })["result"]
+        assert check["count"] == 1, (
+            f"write after version_track restore was silently lost: {check}"
+        )
 
 
 # ── DEX / Dalvik (Android) loader behavior ────────────────────────────────────

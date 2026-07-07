@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Headless mode: a write that aborted mid-transaction could silently discard
+  the *next* successful write on the following save, even an unrelated write
+  from a later command (see
+  https://github.com/NationalSecurityAgency/ghidra/issues/9347).
+
 ## [0.2.0] - 2026-07-06
 
 ### Fixed
